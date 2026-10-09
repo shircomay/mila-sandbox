@@ -65,6 +65,13 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     private var stream: SCStream?
     private let audioOutput = AudioStreamOutput()
 
+    /// FORK: echo cancellation (spec 03). Host capture time of every buffer the
+    /// sample queue yields, one entry per buffer, in yield order; disabled (a
+    /// no-op) unless RecordingSession turns it on for a meeting recording. The
+    /// queue itself lives on `audioOutput` so the SCK callback reaches it
+    /// without crossing back onto the main actor.
+    var timestamps: CaptureTimestampQueue { audioOutput.timestamps }
+
     /// True between `start()` and `stop()` — i.e. "the app still wants system
     /// audio", as opposed to `isRunning` which tracks whether a live SCStream
     /// exists right now. The two diverge exactly when SCK kills the stream
@@ -134,8 +141,8 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
 
     /// Test seam: push a buffer through the same convert-and-yield path an
     /// SCK audio callback takes, on the same serial queue.
-    func deliverForTesting(_ buffer: AVAudioPCMBuffer) {
-        sampleQueue.sync { audioOutput.deliver(buffer) }
+    func deliverForTesting(_ buffer: AVAudioPCMBuffer, hostTimeSeconds: Double? = nil) {  // FORK: defaulted `hostTimeSeconds`, existing callers unchanged
+        sampleQueue.sync { audioOutput.deliver(buffer, hostTimeSeconds: hostTimeSeconds) }
     }
 
     func refreshShareableContent() async {
@@ -447,6 +454,11 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput {
     /// own unordered task, so delivery order wasn't guaranteed.
     var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
 
+    /// FORK: echo cancellation (spec 03). Pushed on the sample queue right
+    /// before each `continuation?.yield`; popped by RecordingSession. Reached
+    /// through `SystemAudioRecorder.timestamps`.
+    let timestamps = CaptureTimestampQueue()
+
     /// Session-scoped stateful converter (resampling keeps filter history
     /// across buffers — see StreamingWhisperConverter). Built lazily from
     /// the first buffer's format and rebuilt if SCK ever changes it; only
@@ -464,18 +476,19 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput {
         guard type == .audio,
               CMSampleBufferIsValid(sampleBuffer),
               let buffer = sampleBuffer.toPCMBuffer() else { return }
-        deliver(buffer)
+        deliver(buffer, hostTimeSeconds: CaptureTimestampQueue.hostTimeSeconds(of: sampleBuffer))  // FORK: echo cancellation (spec 03)
     }
 
     /// Convert to whisper format and yield. Only called on the recorder's
     /// serial sample queue.
-    func deliver(_ buffer: AVAudioPCMBuffer) {
+    func deliver(_ buffer: AVAudioPCMBuffer, hostTimeSeconds: Double? = nil) {  // FORK: defaulted `hostTimeSeconds`, existing callers unchanged
         do {
             if converter == nil || converter?.inputFormat != buffer.format {
                 converter = StreamingWhisperConverter(inputFormat: buffer.format)
             }
             let converted = try converter?.convert(buffer)
                 ?? AudioConvert.toWhisperFormat(buffer)
+            timestamps.push(hostTimeSeconds)  // FORK: one entry per yielded buffer, right before the yield
             continuation?.yield(converted)
             let level = AudioMeter.level(from: converted)
             Task { @MainActor [weak parent] in

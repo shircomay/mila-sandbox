@@ -336,6 +336,16 @@ final class MicrophoneRecorder: ObservableObject {
     /// flight.
     private(set) var gain: AdaptiveGainController?
 
+    // FORK: echo cancellation (spec 03). Host capture time of every buffer the
+    // tap yields, one entry per buffer; disabled (a no-op) unless RecordingSession
+    // turns it on for a meeting recording. Survives engine rebuilds like `gain`.
+    let timestamps = CaptureTimestampQueue()
+    // FORK: echo cancellation (spec 03). When true the tap does NOT apply `gain`;
+    // RecordingSession applies it after the canceller instead (gain that moves
+    // under an adaptive echo filter looks like a changing echo path). Set before
+    // `start()`; `bringUpRealEngine` reads it at every bring-up, rebuilds included.
+    var deferGainToConsumer = false
+
     init() {
         var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation!
         self.audioStream = AsyncStream { continuation = $0 }
@@ -451,6 +461,10 @@ final class MicrophoneRecorder: ObservableObject {
         // timeout can say WHICH microphone did not come up (#291). Stays nil
         // if the stall is earlier than device selection.
         let chosenDevice = OSAllocatedUnfairLock<String?>(initialState: nil)
+        // FORK: read on the main actor at EVERY bring-up (start and each rebuild),
+        // then handed to the off-main tap as plain values.
+        let captureTimestamps = self.timestamps
+        let deferGain = self.deferGainToConsumer
         return try await Self.withTimeout(
             seconds: bringUpTimeout,
             deviceName: { chosenDevice.withLock { $0 } },
@@ -467,6 +481,8 @@ final class MicrophoneRecorder: ObservableObject {
                                        onLevel: onLevel,
                                        gain: gain,
                                        stats: stats,
+                                       timestamps: captureTimestamps,  // FORK: echo cancellation (spec 03)
+                                       deferGain: deferGain,           // FORK: echo cancellation (spec 03)
                                        chosenDevice: chosenDevice)
         }
     }
@@ -759,6 +775,8 @@ final class MicrophoneRecorder: ObservableObject {
         onLevel: @escaping @Sendable (Float) -> Void,
         gain: AdaptiveGainController,
         stats: OSAllocatedUnfairLock<MicFrameStats>,
+        timestamps: CaptureTimestampQueue,  // FORK: echo cancellation (spec 03)
+        deferGain: Bool,                    // FORK: echo cancellation (spec 03)
         chosenDevice: OSAllocatedUnfairLock<String?>
     ) async throws -> EngineBox {
         // Read the user's pinned input UID off the main actor — UserDefaults
@@ -800,7 +818,7 @@ final class MicrophoneRecorder: ObservableObject {
             let sessionConverter = StreamingWhisperConverter(inputFormat: nativeFormat)
             input.installTap(onBus: 0,
                              bufferSize: 4096,
-                             format: nativeFormat) { buffer, _ in
+                             format: nativeFormat) { buffer, when in  // FORK: `when` feeds the capture-timestamp queue
                 onLevel(AudioMeter.level(from: buffer))
                 do {
                     let converted = try sessionConverter?.convert(buffer)
@@ -820,7 +838,7 @@ final class MicrophoneRecorder: ObservableObject {
                     } else {
                         toMutate = converted
                     }
-                    if let channel = toMutate.floatChannelData?[0] {
+                    if !deferGain, let channel = toMutate.floatChannelData?[0] {  // FORK: `!deferGain` — gain moves after the echo canceller when it is on
                         gain.process(channel, count: Int(toMutate.frameLength))
                     }
                     let yielded = Int(toMutate.frameLength)
@@ -832,6 +850,7 @@ final class MicrophoneRecorder: ObservableObject {
                     if isFirst {
                         micLog.log("first mic buffer delivered (\(yielded, privacy: .public) frames) — capture is live")
                     }
+                    timestamps.push(CaptureTimestampQueue.hostTimeSeconds(of: when))  // FORK: one entry per yielded buffer, right before the yield
                     continuation.yield(toMutate)
                 } catch {
                     // Don't log every dropped buffer (could be thousands) —

@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 
 /// Pins the Swift signal generators to the Python ones in

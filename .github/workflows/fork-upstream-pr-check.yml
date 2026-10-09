@@ -1,0 +1,174 @@
+# Fork-only check for the upstream pull-request packages (not part of upstream
+# island-io/mila). Each directory under docs/fork/upstream-prs/ holds a
+# `git format-patch` series plus the BASE commit of island-io/mila it applies
+# to. This workflow does what a reviewer's CI will do with the PR: clone
+# island-io/mila at BASE, apply the series with `git am --3way`, and run the
+# same steps as Fork CI (package tests, Debug build, the FULL MilaTests suite)
+# on THAT tree. It builds exactly what will be submitted, not the fork branch.
+name: Upstream PR check
+
+on:
+  push:
+    branches: ['claude/**']
+    paths: ['docs/fork/upstream-prs/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push waits for the running build instead of cancelling it (only the
+# newest pending run is kept), so every finished run is a complete result.
+concurrency:
+  group: fork-upstream-pr-check-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  list-packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      packages: ${{ steps.list.outputs.packages }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Every docs/fork/upstream-prs/<package>/ directory that has at least one
+      # *.patch file, as a JSON array for the build matrix.
+      - name: List packages
+        id: list
+        run: |
+          set -euo pipefail
+          packages='[]'
+          for dir in docs/fork/upstream-prs/*/; do
+            [ -d "$dir" ] || continue
+            if compgen -G "${dir}*.patch" > /dev/null; then
+              packages=$(jq -c --arg p "$(basename "$dir")" '. + [$p]' <<<"$packages")
+            fi
+          done
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          echo "Packages: $packages"
+
+  build-and-test:
+    needs: list-packages
+    if: needs.list-packages.outputs.packages != '[]'
+    runs-on: macos-26
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.list-packages.outputs.packages) }}
+    env:
+      PACKAGE_DIR: docs/fork/upstream-prs/${{ matrix.package }}
+    steps:
+      # This repository, for the patches only.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          sw_vers
+
+      - name: Clone upstream at BASE
+        run: |
+          set -euo pipefail
+          base="$(tr -d '[:space:]' < "$PACKAGE_DIR/BASE")"
+          echo "BASE: $base"
+          git clone https://github.com/island-io/mila upstream-src
+          git -C upstream-src checkout --detach "$base"
+          git -C upstream-src log --oneline -1
+
+      # Apply the series the way a maintainer would: `git am --3way`. The
+      # throwaway committer identity is only needed because `am` creates commits.
+      - name: Apply the patch series
+        run: |
+          set -euo pipefail
+          git -C upstream-src config user.name "Upstream PR check"
+          git -C upstream-src config user.email "upstream-pr-check@users.noreply.github.com"
+          git -C upstream-src am --3way "$GITHUB_WORKSPACE/$PACKAGE_DIR"/*.patch
+          echo "---- applied commits ----"
+          git -C upstream-src log --oneline "$(tr -d '[:space:]' < "$PACKAGE_DIR/BASE")"..HEAD
+          echo "---- diffstat ----"
+          git -C upstream-src diff --stat "$(tr -d '[:space:]' < "$PACKAGE_DIR/BASE")"
+
+      # Every local package that has a Tests/ directory, in the upstream tree.
+      - name: Run local Swift package tests
+        working-directory: upstream-src
+        run: |
+          set -o pipefail
+          status=0
+          for pkg in Packages/*/; do
+            [ -f "$pkg/Package.swift" ] && [ -d "$pkg/Tests" ] || continue
+            case "$pkg" in Packages/TranscriptionCore/) continue ;; esac  # needs the whisper xcframework; covered by the app build
+            echo "::group::swift test $pkg"
+            (cd "$pkg" && swift test 2>&1 | tee "/tmp/pkg-$(basename "$pkg").log") || { echo "::error::swift test failed in $pkg"; status=1; }
+            echo "::endgroup::"
+          done
+          exit $status
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Cache diarization bundle
+        id: diar-bundle-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: upstream-src/Mila/Resources/PythonRuntime
+          key: upstream-diar-bundle-${{ runner.os }}-${{ hashFiles('upstream-src/scripts/build-diarization-bundle.sh') }}
+
+      - name: Build diarization bundle (cold path only)
+        if: steps.diar-bundle-cache.outputs.cache-hit != 'true'
+        working-directory: upstream-src
+        run: make bundle-diarization
+
+      - name: Generate Xcode project
+        working-directory: upstream-src
+        run: make project
+
+      - name: Resolve Swift Package dependencies
+        working-directory: upstream-src
+        run: |
+          xcodebuild -project Mila.xcodeproj -scheme Mila -destination 'platform=macOS' \
+            -resolvePackageDependencies
+
+      - name: Build (Debug)
+        working-directory: upstream-src
+        run: |
+          set -o pipefail
+          xcodebuild -project Mila.xcodeproj -scheme Mila -configuration Debug \
+            -derivedDataPath build -destination 'platform=macOS' \
+            build 2>&1 | tee /tmp/build.log | grep -E "error:|warning: unre|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" /tmp/build.log || { grep -E "error:" /tmp/build.log | sort -u | head -100; exit 1; }
+
+      - name: Run MilaTests (full unit suite)
+        working-directory: upstream-src
+        run: |
+          set -o pipefail
+          xcodebuild -project Mila.xcodeproj -scheme Mila -configuration Debug \
+            -derivedDataPath build -destination 'platform=macOS' \
+            -only-testing:MilaTests \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 240 \
+            -maximum-test-execution-time-allowance 480 \
+            -resultBundlePath /tmp/MilaTests.xcresult \
+            test > /tmp/test.log 2>&1 || status=$?
+          echo "---- failing test cases ----"
+          grep -E "Test Case .* failed|error: -\[|: error: " /tmp/test.log | sort -u | head -200 || true
+          echo "---- summary ----"
+          grep -E "Executed [0-9]+ tests|\*\* TEST (SUCCEEDED|FAILED)" /tmp/test.log | tail -5 || true
+          exit ${status:-0}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-pr-check-logs-${{ matrix.package }}
+          path: |
+            /tmp/build.log
+            /tmp/test.log
+            /tmp/pkg-*.log
+          if-no-files-found: ignore
+          retention-days: 7

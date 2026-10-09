@@ -1,0 +1,650 @@
+From 5c865b3cbcb935dbbe7a805e323afb965a476565 Mon Sep 17 00:00:00 2001
+From: shircomay <112399495+shircomay@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:50:15 +0000
+Subject: [PATCH 1/4] feat(milakit): add ParagraphTranscriptFormatter for
+ speaker-paragraph Markdown
+
+Groups a transcript's segments into speaker paragraphs with one timestamp
+each, for transcripts that are read as text (knowledge bases, notes) rather
+than played as subtitle cues. Pure and dependency-free, like the rest of
+MilaKit.
+
+- Only adjacent segments of the same speaker group; a returning speaker
+  starts a new paragraph. Segment order is preserved.
+- A paragraph also breaks after a soft word cap (180, only at segment
+  boundaries) and after a long pause (4 s), so undiarized recordings do not
+  become one wall of text.
+- A paragraph's timestamp is its first segment's own start, never borrowed
+  from a later one; an invalid start renders as "[time unavailable]".
+- Spoken text is emitted verbatim. Only speaker labels are escaped, and only
+  text that would open a line as Markdown block syntax gets a guard.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D6Ni8F4iG4iXK8xfgdhSqe
+---
+ .../ParagraphTranscriptFormatter.swift        | 253 +++++++++++++
+ .../ParagraphTranscriptFormatterTests.swift   | 355 ++++++++++++++++++
+ 2 files changed, 608 insertions(+)
+ create mode 100644 Packages/MilaKit/Sources/MilaKit/ParagraphTranscriptFormatter.swift
+ create mode 100644 Packages/MilaKit/Tests/MilaKitTests/ParagraphTranscriptFormatterTests.swift
+
+diff --git a/Packages/MilaKit/Sources/MilaKit/ParagraphTranscriptFormatter.swift b/Packages/MilaKit/Sources/MilaKit/ParagraphTranscriptFormatter.swift
+new file mode 100644
+index 0000000..6eb88be
+--- /dev/null
++++ b/Packages/MilaKit/Sources/MilaKit/ParagraphTranscriptFormatter.swift
+@@ -0,0 +1,253 @@
++import Foundation
++
++/// Renders a transcript as speaker paragraphs with one timestamp per paragraph,
++/// for knowledge bases that ingest the Markdown raw (RAG, search, notes).
++///
++/// Pure and dependency-free like `TranscriptFormatter`: it only needs the
++/// `SpeakerTextSegment` shape plus closures for the things MilaKit cannot know
++/// (display label for a raw speaker ID, segment start/end times).
++///
++/// Output shape: `**[MM:SS] Label:** paragraph text`, paragraphs separated by
++/// one blank line. Spoken text is emitted verbatim (whitespace collapsed to
++/// single spaces) — no backslash escaping and no HTML entities, because the
++/// result is meant to be read as plain text by tools, where `e\-mail` and
++/// `Q&amp;A` are corruption. Only labels (which sit inside `**…**`) and
++/// line-start block syntax in label-less lines are guarded.
++public enum ParagraphTranscriptFormatter {
++
++    public struct Options: Equatable, Sendable {
++        /// Prefix each paragraph with `[MM:SS]` (or `[H:MM:SS]` past one hour).
++        public var includeTimestamps: Bool
++        /// Soft cap on words per paragraph, applied only at segment
++        /// boundaries (a single long segment is never split). 0 = no cap.
++        public var maxWordsPerParagraph: Int
++        /// Start a new paragraph when the silence between two adjacent
++        /// segments of the same speaker is at least this many seconds.
++        /// 0 = never break on pauses.
++        public var pauseBreakSeconds: Double
++
++        public init(includeTimestamps: Bool = true,
++                    maxWordsPerParagraph: Int = 180,
++                    pauseBreakSeconds: Double = 4.0) {
++            self.includeTimestamps = includeTimestamps
++            self.maxWordsPerParagraph = maxWordsPerParagraph
++            self.pauseBreakSeconds = pauseBreakSeconds
++        }
++    }
++
++    public struct Paragraph: Equatable, Sendable {
++        /// Display label; nil when the transcript has no speaker labels at all.
++        public var label: String?
++        /// Start of the paragraph's FIRST non-empty segment. Nil when that
++        /// segment had no usable start — never borrowed from a later segment.
++        public var startSeconds: Double?
++        public var text: String
++
++        public init(label: String?, startSeconds: Double?, text: String) {
++            self.label = label
++            self.startSeconds = startSeconds
++            self.text = text
++        }
++    }
++
++    /// Label given to a segment with no speaker in a transcript where other
++    /// segments do have one. Never guessed from neighbours.
++    public static let unidentifiedLabel = "Unidentified speaker"
++
++    // MARK: - Grouping
++
++    /// Group `segments` into paragraphs. Only ADJACENT segments group, and the
++    /// input order is preserved exactly (no sorting by time).
++    public static func paragraphs<S: SpeakerTextSegment>(
++        segments: [S],
++        label: (String) -> String,
++        start: (S) -> Double?,
++        end: (S) -> Double?,
++        options: Options = Options()
++    ) -> [Paragraph] {
++        // A segment whose speaker is empty counts as unlabelled, matching
++        // how the app treats an empty ID elsewhere.
++        func rawSpeaker(_ segment: S) -> String? {
++            guard let raw = segment.speaker,
++                  !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
++            return raw
++        }
++
++        var items: [(segment: S, text: String)] = []
++        for segment in segments {
++            let text = oneLine(segment.text)
++            if !text.isEmpty { items.append((segment, text)) }
++        }
++        guard !items.isEmpty else { return [] }
++
++        let anyLabelled = items.contains { rawSpeaker($0.segment) != nil }
++        let needStart = options.includeTimestamps || options.pauseBreakSeconds > 0
++        let needEnd = options.pauseBreakSeconds > 0
++
++        var result: [Paragraph] = []
++        var active = false
++        var currentLabel: String?
++        var currentStart: Double?
++        var currentParts: [String] = []
++        var currentWords = 0
++        var previousEnd: Double?
++
++        func flush() {
++            guard active else { return }
++            result.append(Paragraph(label: currentLabel,
++                                    startSeconds: currentStart,
++                                    text: currentParts.joined(separator: " ")))
++            currentParts.removeAll(keepingCapacity: true)
++            currentWords = 0
++            currentStart = nil
++            active = false
++        }
++
++        for item in items {
++            let segment = item.segment
++            let resolved: String?
++            if let raw = rawSpeaker(segment) {
++                let shown = oneLine(label(raw))
++                resolved = shown.isEmpty ? raw : shown
++            } else {
++                resolved = anyLabelled ? unidentifiedLabel : nil
++            }
++            let words = item.text.split(whereSeparator: { $0.isWhitespace }).count
++            let segStart: Double? = needStart ? start(segment) : nil
++            let segEnd: Double? = needEnd ? end(segment) : nil
++
++            if active {
++                var breakHere = resolved != currentLabel
++                if !breakHere, options.maxWordsPerParagraph > 0,
++                   currentWords + words > options.maxWordsPerParagraph {
++                    breakHere = true
++                }
++                if !breakHere, options.pauseBreakSeconds > 0,
++                   let s = segStart, let e = previousEnd,
++                   s.isFinite, e.isFinite,
++                   s - e >= options.pauseBreakSeconds {
++                    breakHere = true
++                }
++                if breakHere { flush() }
++            }
++
++            if !active {
++                active = true
++                currentLabel = resolved
++                // Captured once, even when absent or invalid: a later
++                // segment's time must never stand in for this paragraph's.
++                currentStart = options.includeTimestamps ? segStart : nil
++            }
++            currentParts.append(item.text)
++            currentWords += words
++            previousEnd = segEnd
++        }
++        flush()
++        return result
++    }
++
++    // MARK: - Rendering
++
++    /// The Markdown body: paragraphs joined by one blank line, no trailing
++    /// newline. Empty string when there is nothing to render.
++    ///
++    /// `fallback` is an `@autoclosure` and is evaluated ONLY when no
++    /// non-empty segment exists (it may read a file); do not hoist it.
++    public static func markdown<S: SpeakerTextSegment>(
++        segments: [S],
++        fallback: @autoclosure () -> String,
++        label: (String) -> String,
++        start: (S) -> Double?,
++        end: (S) -> Double?,
++        options: Options = Options()
++    ) -> String {
++        let grouped = paragraphs(segments: segments, label: label,
++                                 start: start, end: end, options: options)
++        if grouped.isEmpty {
++            let text = oneLine(fallback())
++            guard !text.isEmpty else { return "" }
++            return options.includeTimestamps
++                ? "**[time unavailable]** \(text)"
++                : guardBlockSyntax(text)
++        }
++        return grouped
++            .map { render($0, includeTimestamps: options.includeTimestamps) }
++            .joined(separator: "\n\n")
++    }
++
++    /// Recording-relative start time, floored to a whole second (never
++    /// rounded up). `MM:SS` below one hour, `HH:MM:SS` thereafter; hours do
++    /// not wrap. Invalid or missing values stay unknown (nil).
++    public static func timestamp(_ seconds: Double?) -> String? {
++        guard let seconds, seconds.isFinite, seconds >= 0,
++              seconds < Double(Int.max) else { return nil }
++        let whole = Int(seconds.rounded(.down))
++        func two(_ value: Int) -> String {
++            let text = String(value)
++            return text.count < 2 ? "0" + text : text
++        }
++        let hours = whole / 3600
++        let minutes = (whole % 3600) / 60
++        let remainder = whole % 60
++        if hours == 0 { return "\(two(minutes)):\(two(remainder))" }
++        return "\(two(hours)):\(two(minutes)):\(two(remainder))"
++    }
++
++    /// Collapse every whitespace run (including newlines) to one space and trim.
++    public static func oneLine(_ text: String) -> String {
++        text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
++    }
++
++    // MARK: - Private helpers
++
++    private static func render(_ paragraph: Paragraph, includeTimestamps: Bool) -> String {
++        let stamp: String? = includeTimestamps
++            ? "[\(timestamp(paragraph.startSeconds) ?? "time unavailable")]"
++            : nil
++        let text = paragraph.text
++        if let label = paragraph.label {
++            let shown = escapeLabel(label)
++            if let stamp = stamp {
++                return "**\(stamp) \(shown):** \(text)"
++            }
++            return "**\(shown):** \(text)"
++        }
++        if let stamp = stamp {
++            return "**\(stamp)** \(text)"
++        }
++        return guardBlockSyntax(text)
++    }
++
++    /// Escape the characters that would end or disturb bold emphasis. Applies
++    /// to labels only; spoken text is never escaped.
++    private static func escapeLabel(_ label: String) -> String {
++        let special: [Character] = ["\\", "*", "_", "[", "]", "`"]
++        var out = ""
++        for character in label {
++            if special.contains(character) { out.append("\\") }
++            out.append(character)
++        }
++        return out
++    }
++
++    /// For a line that STARTS with spoken text (no label, no timestamp): put
++    /// one backslash before a leading character that would turn the line into
++    /// a heading, quote, list item, rule, table row or fence. For an ordered
++    /// list marker (`12. `, `3) `) the backslash goes before the `.` / `)`.
++    private static func guardBlockSyntax(_ text: String) -> String {
++        guard let first = text.first else { return text }
++        let blockStarts: [Character] = ["#", ">", "-", "+", "*", "=", "|"]
++        if blockStarts.contains(first) || text.hasPrefix("```") || text.hasPrefix("~~~") {
++            return "\\" + text
++        }
++        var index = text.startIndex
++        while index < text.endIndex, ("0"..."9").contains(text[index]) {
++            index = text.index(after: index)
++        }
++        guard index > text.startIndex, index < text.endIndex,
++              text[index] == "." || text[index] == ")" else { return text }
++        let afterMarker = text.index(after: index)
++        guard afterMarker < text.endIndex, text[afterMarker] == " " else { return text }
++        return String(text[..<index]) + "\\" + String(text[index...])
++    }
++}
+diff --git a/Packages/MilaKit/Tests/MilaKitTests/ParagraphTranscriptFormatterTests.swift b/Packages/MilaKit/Tests/MilaKitTests/ParagraphTranscriptFormatterTests.swift
+new file mode 100644
+index 0000000..c7d21c0
+--- /dev/null
++++ b/Packages/MilaKit/Tests/MilaKitTests/ParagraphTranscriptFormatterTests.swift
+@@ -0,0 +1,355 @@
++import XCTest
++@testable import MilaKit
++
++private struct TSeg: SpeakerTextSegment {
++    var text: String
++    var speaker: String?
++    var start: Double?
++    var end: Double?
++
++    init(_ text: String, _ speaker: String? = nil, start: Double? = nil, end: Double? = nil) {
++        self.text = text
++        self.speaker = speaker
++        self.start = start
++        self.end = end
++    }
++}
++
++final class ParagraphTranscriptFormatterTests: XCTestCase {
++
++    /// Resolves a raw ID through `names`, falling back to the raw ID.
++    private func render(_ segments: [TSeg],
++                        names: [String: String] = [:],
++                        limit: Int = 180,
++                        fallback: String = "",
++                        timestamps: Bool = false,
++                        pause: Double = 0) -> String {
++        ParagraphTranscriptFormatter.markdown(
++            segments: segments,
++            fallback: fallback,
++            label: { id in names[id] ?? id },
++            start: { $0.start },
++            end: { $0.end },
++            options: ParagraphTranscriptFormatter.Options(includeTimestamps: timestamps,
++                                                          maxWordsPerParagraph: limit,
++                                                          pauseBreakSeconds: pause)
++        )
++    }
++
++    private let timed = [
++        TSeg("First sentence.", "a", start: 222.8),
++        TSeg("Second sentence.", "a", start: 230.1),
++        TSeg("תודה רבה.", "b", start: 248.4),
++        TSeg("You're welcome.", "a", start: 253.2),
++    ]
++
++    // MARK: grouping and labels (ported from the kit)
++
++    func test_adjacent_grouping_hebrew_and_returning_speaker() {
++        let conversation = [TSeg(" First sentence.", "a"), TSeg("Second sentence.", "a"),
++                            TSeg("תודה רבה.", "b"), TSeg("You're welcome.", "a")]
++        let output = render(conversation, names: ["a": "Dana", "b": "מילה"])
++        XCTAssertEqual(output, "**Dana:** First sentence. Second sentence.\n\n**מילה:** תודה רבה.\n\n**Dana:** You're welcome.")
++        XCTAssertEqual(output.components(separatedBy: "\n\n").count, 3,
++                       "a returning speaker gets a new paragraph")
++    }
++
++    func test_no_deduplication() {
++        XCTAssertEqual(render([TSeg("Yes.", "a"), TSeg("Yes.", "a")]), "**a:** Yes. Yes.")
++    }
++
++    func test_identically_named_speakers_group_together() {
++        XCTAssertEqual(render([TSeg("Hi", "a"), TSeg("there", "b")], names: ["a": "Dana", "b": "Dana"]),
++                       "**Dana:** Hi there")
++    }
++
++    func test_blank_segments_use_fallback() {
++        XCTAssertEqual(render([TSeg(" "), TSeg("\n")], fallback: "Fallback text"), "Fallback text")
++    }
++
++    func test_unlabelled_segments_have_no_label() {
++        XCTAssertEqual(render([TSeg("Hello"), TSeg("world")]), "Hello world")
++    }
++
++    func test_unlabelled_segment_in_labelled_transcript_is_unidentified() {
++        let out = render([TSeg("Hello", "a"), TSeg("unknown"), TSeg("again", "a")])
++        XCTAssertEqual(out, "**a:** Hello\n\n**Unidentified speaker:** unknown\n\n**a:** again")
++    }
++
++    func test_length_cap_splits_at_segment_boundary() {
++        let out = render([TSeg("one two", "a"), TSeg("three four", "a")], limit: 3)
++        XCTAssertEqual(out, "**a:** one two\n\n**a:** three four")
++    }
++
++    func test_single_long_segment_is_never_split() {
++        let out = render([TSeg("one two three four five six", "a")], limit: 3)
++        XCTAssertEqual(out, "**a:** one two three four five six")
++    }
++
++    func test_whitespace_runs_collapse() {
++        XCTAssertEqual(render([TSeg("a\nb\tc", "a")]), "**a:** a b c")
++    }
++
++    func test_blank_label_falls_back_to_raw_id() {
++        let out = ParagraphTranscriptFormatter.markdown(
++            segments: [TSeg("test", "a")],
++            fallback: "",
++            label: { _ in " \n " },
++            start: { $0.start },
++            end: { $0.end },
++            options: ParagraphTranscriptFormatter.Options(includeTimestamps: false)
++        )
++        XCTAssertEqual(out, "**a:** test")
++    }
++
++    func test_empty_transcript_is_empty() {
++        XCTAssertEqual(render([]), "")
++    }
++
++    func test_mixed_languages_keep_order() {
++        XCTAssertEqual(render([TSeg("שלום English שלום", "a")]), "**a:** שלום English שלום")
++        XCTAssertEqual(render([TSeg("Hello", "a"), TSeg("שלום", "a"), TSeg("again", "a")]),
++                       "**a:** Hello שלום again")
++    }
++
++    func test_segment_order_is_preserved_not_sorted_by_time() {
++        let out = render([TSeg("first", "a", start: 20), TSeg("reply", "b", start: 19)], timestamps: true)
++        XCTAssertEqual(out, "**[00:20] a:** first\n\n**[00:19] b:** reply")
++    }
++
++    // MARK: verbatim text, label escaping, block guard
++
++    func test_spoken_text_is_verbatim() {
++        let text = "e-mail Q&A *laughs* [Music] <b>x</b> # 1. a_b | c"
++        XCTAssertEqual(render([TSeg(text, "a")]), "**a:** \(text)")
++        XCTAssertEqual(render([TSeg(text, "a", start: 5)], timestamps: true), "**[00:05] a:** \(text)")
++    }
++
++    func test_label_is_escaped_for_bold_context() {
++        XCTAssertEqual(render([TSeg("hi", "x")], names: ["x": "A*B"]), "**A\\*B:** hi")
++        XCTAssertEqual(render([TSeg("hi", "x")], names: ["x": "a_b [c] `d` \\e"]),
++                       "**a\\_b \\[c\\] \\`d\\` \\\\e:** hi")
++    }
++
++    func test_block_guard_on_unlabelled_untimed_text() {
++        XCTAssertEqual(render([TSeg("# not a heading")]), "\\# not a heading")
++        XCTAssertEqual(render([TSeg("1. item")]), "1\\. item")
++        XCTAssertEqual(render([TSeg("12) item")]), "12\\) item")
++        XCTAssertEqual(render([TSeg("> quote")]), "\\> quote")
++        XCTAssertEqual(render([TSeg("- dash")]), "\\- dash")
++        XCTAssertEqual(render([TSeg("+ plus")]), "\\+ plus")
++        XCTAssertEqual(render([TSeg("* star")]), "\\* star")
++        XCTAssertEqual(render([TSeg("=== rule")]), "\\=== rule")
++        XCTAssertEqual(render([TSeg("| cell")]), "\\| cell")
++        XCTAssertEqual(render([TSeg("```code")]), "\\```code")
++        XCTAssertEqual(render([TSeg("~~~code")]), "\\~~~code")
++    }
++
++    func test_block_guard_leaves_plain_text_alone() {
++        XCTAssertEqual(render([TSeg("2024 was a year")]), "2024 was a year")
++        XCTAssertEqual(render([TSeg("3.5 percent")]), "3.5 percent")
++        XCTAssertEqual(render([TSeg("1.")]), "1.")
++    }
++
++    func test_block_guard_not_applied_when_a_label_or_timestamp_leads_the_line() {
++        XCTAssertEqual(render([TSeg("# heading", "a")]), "**a:** # heading")
++        XCTAssertEqual(render([TSeg("# heading", start: 1)], timestamps: true), "**[00:01]** # heading")
++    }
++
++    // MARK: timestamps (ported from the kit)
++
++    func test_exact_paragraph_timestamps() {
++        let stamped = render(timed, names: ["a": "Dana", "b": "מילה"], timestamps: true)
++        XCTAssertEqual(stamped, "**[03:42] Dana:** First sentence. Second sentence.\n\n**[04:08] מילה:** תודה רבה.\n\n**[04:13] Dana:** You're welcome.")
++        XCTAssertFalse(stamped.contains("[03:50]"), "no timestamp on the second sentence")
++        XCTAssertFalse(stamped.contains("-->"), "no SRT ranges")
++    }
++
++    func test_long_turn_split_receives_its_own_actual_start() {
++        let segs = [TSeg("one two", "a", start: 3), TSeg("three four", "a", start: 8)]
++        XCTAssertEqual(render(segs, limit: 3, timestamps: true),
++                       "**[00:03] a:** one two\n\n**[00:08] a:** three four")
++        XCTAssertEqual(render(segs, limit: 0, timestamps: true),
++                       "**[00:03] a:** one two three four")
++    }
++
++    func test_unlabelled_timed_paragraph() {
++        XCTAssertEqual(render([TSeg("Hello", start: 62), TSeg("world", start: 65)], timestamps: true),
++                       "**[01:02]** Hello world")
++    }
++
++    func test_merged_names_retain_first_timestamp() {
++        let segs = [TSeg("Hi", "a", start: 1), TSeg("there", "b", start: 2)]
++        XCTAssertEqual(render(segs, names: ["a": "Dana", "b": "Dana"], timestamps: true),
++                       "**[00:01] Dana:** Hi there")
++    }
++
++    func test_blank_segments_do_not_supply_the_paragraph_start() {
++        let segs = [TSeg(" ", "a", start: 1), TSeg("First words", "a", start: 17.5)]
++        XCTAssertEqual(render(segs, timestamps: true), "**[00:17] a:** First words")
++    }
++
++    func test_never_borrow_a_later_segments_timestamp() {
++        let segs = [TSeg("Missing start", "a"), TSeg("Later text", "a", start: 22)]
++        XCTAssertEqual(render(segs, timestamps: true),
++                       "**[time unavailable] a:** Missing start Later text")
++    }
++
++    func test_invalid_time_is_explicit_not_zero() {
++        XCTAssertEqual(render([TSeg("invalid", "a", start: -.infinity)], timestamps: true),
++                       "**[time unavailable] a:** invalid")
++    }
++
++    func test_unknown_speaker_is_not_invented_with_timestamps() {
++        let segs = [TSeg("unknown", start: 15), TSeg("named", "a", start: 18)]
++        XCTAssertEqual(render(segs, timestamps: true),
++                       "**[00:15] Unidentified speaker:** unknown\n\n**[00:18] a:** named")
++    }
++
++    func test_timestamp_fallbacks() {
++        XCTAssertEqual(render([], fallback: "Plain text only", timestamps: true),
++                       "**[time unavailable]** Plain text only")
++        XCTAssertEqual(render([], timestamps: true), "")
++        XCTAssertEqual(render([], fallback: "# plain", timestamps: false), "\\# plain")
++    }
++
++    func test_timestamp_toggle_does_not_change_the_grouping() {
++        let on = render(timed, timestamps: true)
++        let off = render(timed, timestamps: false)
++        XCTAssertEqual(on.components(separatedBy: "\n\n").count,
++                       off.components(separatedBy: "\n\n").count)
++    }
++
++    func test_disabled_timestamps_and_pauses_do_not_read_timing() {
++        var reads = 0
++        _ = ParagraphTranscriptFormatter.markdown(
++            segments: timed,
++            fallback: "",
++            label: { $0 },
++            start: { segment in reads += 1; return segment.start },
++            end: { segment in reads += 1; return segment.end },
++            options: ParagraphTranscriptFormatter.Options(includeTimestamps: false,
++                                                          maxWordsPerParagraph: 180,
++                                                          pauseBreakSeconds: 0)
++        )
++        XCTAssertEqual(reads, 0)
++    }
++
++    func test_timestamp_function() {
++        let f = ParagraphTranscriptFormatter.timestamp
++        XCTAssertEqual(f(0), "00:00")
++        XCTAssertEqual(f(59.9999), "00:59", "floors below a minute boundary")
++        XCTAssertEqual(f(60), "01:00")
++        XCTAssertEqual(f(3599.9999), "59:59", "floors below an hour boundary")
++        XCTAssertEqual(f(3600), "01:00:00")
++        XCTAssertEqual(f(3723.9), "01:02:03")
++        XCTAssertEqual(f(360000), "100:00:00", "hours do not wrap")
++        XCTAssertNil(f(nil))
++        XCTAssertNil(f(-1))
++        XCTAssertNil(f(.nan))
++        XCTAssertNil(f(.infinity))
++        XCTAssertNil(f(Double.greatestFiniteMagnitude))
++    }
++
++    func test_default_options_put_timestamps_on() {
++        let out = ParagraphTranscriptFormatter.markdown(
++            segments: timed, fallback: "",
++            label: { $0 }, start: { $0.start }, end: { $0.end })
++        XCTAssertTrue(out.hasPrefix("**[03:42] a:**"))
++        XCTAssertEqual(ParagraphTranscriptFormatter.Options(),
++                       ParagraphTranscriptFormatter.Options(includeTimestamps: true,
++                                                            maxWordsPerParagraph: 180,
++                                                            pauseBreakSeconds: 4.0))
++    }
++
++    func test_hour_timestamp_in_a_paragraph() {
++        XCTAssertEqual(render([TSeg("late", "a", start: 3723.9)], timestamps: true),
++                       "**[01:02:03] a:** late")
++    }
++
++    // MARK: pause breaks
++
++    func test_pause_break_splits_a_same_speaker_turn() {
++        let segs = [TSeg("before", "a", start: 0, end: 2), TSeg("after", "a", start: 10, end: 12)]
++        XCTAssertEqual(render(segs, timestamps: true, pause: 4),
++                       "**[00:00] a:** before\n\n**[00:10] a:** after")
++    }
++
++    func test_pause_break_off_keeps_one_paragraph() {
++        let segs = [TSeg("before", "a", start: 0, end: 2), TSeg("after", "a", start: 10, end: 12)]
++        XCTAssertEqual(render(segs, timestamps: true, pause: 0),
++                       "**[00:00] a:** before after")
++    }
++
++    func test_pause_shorter_than_threshold_does_not_break() {
++        let segs = [TSeg("before", "a", start: 0, end: 2), TSeg("after", "a", start: 5.9, end: 7)]
++        XCTAssertEqual(render(segs, timestamps: true, pause: 4), "**[00:00] a:** before after")
++    }
++
++    func test_pause_exactly_at_threshold_breaks() {
++        let segs = [TSeg("before", "a", start: 0, end: 2), TSeg("after", "a", start: 6, end: 7)]
++        XCTAssertEqual(render(segs, timestamps: true, pause: 4),
++                       "**[00:00] a:** before\n\n**[00:06] a:** after")
++    }
++
++    func test_pause_break_works_without_timestamps() {
++        let segs = [TSeg("before", "a", start: 0, end: 2), TSeg("after", "a", start: 10, end: 12)]
++        XCTAssertEqual(render(segs, timestamps: false, pause: 4), "**a:** before\n\n**a:** after")
++    }
++
++    func test_pause_break_ignored_when_times_are_not_finite() {
++        let nanStart = [TSeg("before", "a", start: 0, end: 2), TSeg("after", "a", start: .nan, end: 12)]
++        XCTAssertEqual(render(nanStart, timestamps: false, pause: 4), "**a:** before after")
++        let infEnd = [TSeg("before", "a", start: 0, end: .infinity), TSeg("after", "a", start: 100, end: 101)]
++        XCTAssertEqual(render(infEnd, timestamps: false, pause: 4), "**a:** before after")
++        let missing = [TSeg("before", "a"), TSeg("after", "a", start: 100)]
++        XCTAssertEqual(render(missing, timestamps: false, pause: 4), "**a:** before after")
++    }
++
++    func test_pause_is_measured_from_the_previous_non_empty_segment() {
++        let segs = [TSeg("before", "a", start: 0, end: 2),
++                    TSeg("  ", "a", start: 50, end: 60),
++                    TSeg("after", "a", start: 3, end: 4)]
++        XCTAssertEqual(render(segs, timestamps: false, pause: 4), "**a:** before after")
++    }
++
++    // MARK: paragraphs() and the lazy fallback
++
++    func test_paragraphs_expose_label_start_and_text() {
++        let paras = ParagraphTranscriptFormatter.paragraphs(
++            segments: timed,
++            label: { $0.uppercased() },
++            start: { $0.start },
++            end: { $0.end },
++            options: ParagraphTranscriptFormatter.Options(pauseBreakSeconds: 0)
++        )
++        XCTAssertEqual(paras, [
++            ParagraphTranscriptFormatter.Paragraph(label: "A", startSeconds: 222.8,
++                                                   text: "First sentence. Second sentence."),
++            ParagraphTranscriptFormatter.Paragraph(label: "B", startSeconds: 248.4, text: "תודה רבה."),
++            ParagraphTranscriptFormatter.Paragraph(label: "A", startSeconds: 253.2, text: "You're welcome."),
++        ])
++    }
++
++    func test_paragraph_label_is_nil_when_nothing_is_labelled() {
++        let paras = ParagraphTranscriptFormatter.paragraphs(
++            segments: [TSeg("one"), TSeg("two")],
++            label: { $0 }, start: { $0.start }, end: { $0.end })
++        XCTAssertEqual(paras.count, 1)
++        XCTAssertNil(paras[0].label)
++    }
++
++    func test_fallback_is_not_evaluated_when_segments_exist() {
++        var fallbackReads = 0
++        func readFallback() -> String { fallbackReads += 1; return "fallback" }
++        _ = ParagraphTranscriptFormatter.markdown(
++            segments: timed, fallback: readFallback(),
++            label: { $0 }, start: { $0.start }, end: { $0.end })
++        XCTAssertEqual(fallbackReads, 0)
++
++        _ = ParagraphTranscriptFormatter.markdown(
++            segments: [TSeg("  ")], fallback: readFallback(),
++            label: { $0 }, start: { $0.start }, end: { $0.end })
++        XCTAssertEqual(fallbackReads, 1, "evaluated exactly once when there is nothing else to render")
++    }
++}

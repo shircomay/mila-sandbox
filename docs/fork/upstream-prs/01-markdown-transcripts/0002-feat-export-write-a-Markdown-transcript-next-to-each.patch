@@ -1,0 +1,1369 @@
+From 0ce52d71beaff17c9d7d853beb33249c10cfc518 Mon Sep 17 00:00:00 2001
+From: shircomay <112399495+shircomay@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:50:20 +0000
+Subject: [PATCH 2/4] feat(export): write a Markdown transcript next to each
+ recording
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds an opt-in `.md` transcript written beside the `.srt`, and an
+"Export Transcript (.md)…" command next to "Export Subtitles (.srt)…".
+
+- MarkdownTranscriptExporter adapts a Recording to MilaKit's
+  ParagraphTranscriptFormatter and owns the YAML front matter and file I/O.
+  Speaker labels use displaySpeakerName, so the .md, the UI and the .srt
+  agree.
+- MarkdownExportSettings (markdownExport.* keys): sidecar on/off (default
+  off), paragraph timestamps (default on), and what vault notes contain.
+- TranscriptExporter.writeSRT also writes the sidecar, which covers every
+  RecordingStore call site. RecordingStore removes the .md with the .srt, and
+  rewrites it when a completed recording is renamed or retitled.
+- Settings > Storage gets a "Markdown transcripts" section with a one-shot
+  "Write Markdown for existing recordings" backfill.
+
+The .srt is still written: the subtitle-video feature reads it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D6Ni8F4iG4iXK8xfgdhSqe
+---
+ Mila/App/MilaApp.swift                        |   6 +
+ Mila/Models/MarkdownExportSettings.swift      | 100 +++++
+ Mila/Models/RecordingStore.swift              |  13 +
+ .../MarkdownTranscriptExporter.swift          | 228 ++++++++++
+ Mila/Transcription/TranscriptExporter.swift   |   3 +
+ .../Views/MarkdownExportSettingsSection.swift |  80 ++++
+ .../Views/MarkdownTranscriptExportPanel.swift |  30 ++
+ Mila/Views/RecordingContextMenu.swift         |   2 +
+ Mila/Views/RecordingDetailView.swift          |   9 +
+ Mila/Views/StorageSettingsTab.swift           |   1 +
+ MilaTests/MarkdownExportSettingsTests.swift   |  99 +++++
+ .../MarkdownTranscriptExporterTests.swift     | 404 ++++++++++++++++++
+ MilaTests/RecordingTitleRefreshTests.swift    | 175 ++++++++
+ 13 files changed, 1150 insertions(+)
+ create mode 100644 Mila/Models/MarkdownExportSettings.swift
+ create mode 100644 Mila/Transcription/MarkdownTranscriptExporter.swift
+ create mode 100644 Mila/Views/MarkdownExportSettingsSection.swift
+ create mode 100644 Mila/Views/MarkdownTranscriptExportPanel.swift
+ create mode 100644 MilaTests/MarkdownExportSettingsTests.swift
+ create mode 100644 MilaTests/MarkdownTranscriptExporterTests.swift
+ create mode 100644 MilaTests/RecordingTitleRefreshTests.swift
+
+diff --git a/Mila/App/MilaApp.swift b/Mila/App/MilaApp.swift
+index 2d2c107..db6006a 100644
+--- a/Mila/App/MilaApp.swift
++++ b/Mila/App/MilaApp.swift
+@@ -365,6 +365,7 @@ struct MilaApp: App {
+     /// installed; a second instance would mean two views of one install.
+     @StateObject private var claudeSetupSettings: ClaudeSetupSettings
+     @StateObject private var obsidianExporter: ObsidianExporter
++    @StateObject private var markdownExportSettings: MarkdownExportSettings
+     @StateObject private var voiceMemosSettings: VoiceMemosSettings
+     @StateObject private var voiceMemosImporter: VoiceMemosImporter
+     /// Persistent, app-wide list of speaker names — the pick-list behind
+@@ -593,6 +594,7 @@ struct MilaApp: App {
+             NSWorkspace.shared.open(url)
+         })
+         let obsidian = ObsidianExporter(settings: obsidianSettings)
++        let markdownExport = MarkdownExportSettings()
+         // Write the note once the summary state is final. Gated on `pending`
+         // so a launch-time backfill sweep never re-files the back-catalogue.
+         summarizer.onSummaryFinished = { [weak obsidian] rec in
+@@ -931,6 +933,7 @@ struct MilaApp: App {
+         _mcpAccessSettings = StateObject(wrappedValue: mcpAccess)
+         _claudeSetupSettings = StateObject(wrappedValue: claudeSetup)
+         _obsidianExporter = StateObject(wrappedValue: obsidian)
++        _markdownExportSettings = StateObject(wrappedValue: markdownExport)
+         // Voice Memos (iPhone) folder integration. Settings are opt-in and
+         // default-off; the importer wires up its FSEvents watcher + initial
+         // backfill from its `start()` launch task (below), so constructing
+@@ -990,6 +993,7 @@ struct MilaApp: App {
+                 .of("mcpAccessSettings", mcpAccess),
+                 .of("claudeSetupSettings", claudeSetup),
+                 .of("obsidianExporter", obsidian),
++                .of("markdownExportSettings", markdownExport),
+                 .of("voiceMemosSettings", vmSettings),
+                 .of("voiceMemosImporter", vmImporter),
+                 .of("configImporter", configImporter),
+@@ -1080,6 +1084,7 @@ struct MilaApp: App {
+                 .environmentObject(mcpAccessSettings)
+                 .environmentObject(claudeSetupSettings)
+                 .environmentObject(obsidianExporter)
++                .environmentObject(markdownExportSettings)
+         }
+         .commands {
+             CommandGroup(after: .appInfo) {
+@@ -1147,6 +1152,7 @@ struct MilaApp: App {
+                 .environmentObject(mcpAccessSettings)
+                 .environmentObject(claudeSetupSettings)
+                 .environmentObject(obsidianExporter)
++                .environmentObject(markdownExportSettings)
+         }
+         // Settings used to be pinned to 700×560 by a rigid `.frame` inside
+         // `SettingsView`; since #177 it is a resizable sidebar window whose
+diff --git a/Mila/Models/MarkdownExportSettings.swift b/Mila/Models/MarkdownExportSettings.swift
+new file mode 100644
+index 0000000..9ddea78
+--- /dev/null
++++ b/Mila/Models/MarkdownExportSettings.swift
+@@ -0,0 +1,100 @@
++import Foundation
++import Combine
++
++/// Settings for the paragraph Markdown transcript (`.md` sidecar next to each
++/// recording, the content mode of vault notes, the "Export Transcript (.md)…"
++/// command). See `MarkdownTranscriptExporter`.
++///
++/// Deliberately NOT `@MainActor`, unlike most settings objects: the static
++/// readers below are called from nonisolated exporter code
++/// (`TranscriptExporter.writeSRT(for:in:)`, `ObsidianExporter.markdown`), and
++/// a main-actor-isolated static would not be callable from there. Every
++/// mutation of the `@Published` properties comes from SwiftUI on the main
++/// thread.
++///
++/// The code defaults keep Mila's existing behaviour (sidecar OFF, summary else
++/// transcript). The readers use `object(forKey:)` / `string(forKey:)` rather
++/// than assuming "absent means false", so an unset key keeps its code default
++/// (the timestamps toggle defaults to ON).
++final class MarkdownExportSettings: ObservableObject {
++    static let sidecarEnabledKey = "markdownExport.sidecarEnabled"
++    static let paragraphTimestampsKey = "markdownExport.paragraphTimestamps"
++    static let noteContentKey = "markdownExport.noteContent"
++
++    /// What a vault note (Obsidian export) contains.
++    enum NoteContent: String, CaseIterable {
++        /// Upstream behaviour: the AI summary when one exists, otherwise the transcript.
++        case summaryElseTranscript
++        /// The full paragraph transcript, never the summary.
++        case transcript
++        /// The AI summary followed by the full paragraph transcript.
++        case summaryAndTranscript
++
++        var displayName: String {
++            switch self {
++            case .summaryElseTranscript: return "Summary (or transcript if no summary)"
++            case .transcript: return "Full transcript"
++            case .summaryAndTranscript: return "Summary + full transcript"
++            }
++        }
++    }
++
++    /// The three values as plain data, for call sites that have no settings
++    /// object to hand (static exporters, background work).
++    struct Snapshot: Equatable {
++        var sidecarEnabled: Bool
++        var paragraphTimestamps: Bool
++        var noteContent: NoteContent
++    }
++
++    static let defaultSidecarEnabled = false
++    static let defaultParagraphTimestamps = true
++    static let defaultNoteContent = NoteContent.summaryElseTranscript
++
++    /// Write a `.md` transcript next to each recording's `.srt`.
++    @Published var sidecarEnabled: Bool {
++        didSet {
++            guard sidecarEnabled != oldValue else { return }
++            defaults.set(sidecarEnabled, forKey: Self.sidecarEnabledKey)
++        }
++    }
++
++    /// Put a `[MM:SS]` timestamp on each paragraph.
++    @Published var paragraphTimestamps: Bool {
++        didSet {
++            guard paragraphTimestamps != oldValue else { return }
++            defaults.set(paragraphTimestamps, forKey: Self.paragraphTimestampsKey)
++        }
++    }
++
++    /// What Obsidian vault notes contain.
++    @Published var noteContent: NoteContent {
++        didSet {
++            guard noteContent != oldValue else { return }
++            defaults.set(noteContent.rawValue, forKey: Self.noteContentKey)
++        }
++    }
++
++    private let defaults: UserDefaults
++
++    init(defaults: UserDefaults = .standard) {
++        self.defaults = defaults
++        let snapshot = Self.current(defaults)
++        self.sidecarEnabled = snapshot.sidecarEnabled
++        self.paragraphTimestamps = snapshot.paragraphTimestamps
++        self.noteContent = snapshot.noteContent
++    }
++
++    /// Read the persisted values (or the code defaults). An
++    /// unrecognised `noteContent` string falls back to the default rather
++    /// than failing.
++    static func current(_ defaults: UserDefaults = .standard) -> Snapshot {
++        let sidecar = defaults.object(forKey: sidecarEnabledKey) as? Bool ?? defaultSidecarEnabled
++        let timestamps = defaults.object(forKey: paragraphTimestampsKey) as? Bool ?? defaultParagraphTimestamps
++        let content = defaults.string(forKey: noteContentKey).flatMap(NoteContent.init(rawValue:))
++            ?? defaultNoteContent
++        return Snapshot(sidecarEnabled: sidecar,
++                        paragraphTimestamps: timestamps,
++                        noteContent: content)
++    }
++}
+diff --git a/Mila/Models/RecordingStore.swift b/Mila/Models/RecordingStore.swift
+index b6a6678..ee7d8d2 100644
+--- a/Mila/Models/RecordingStore.swift
++++ b/Mila/Models/RecordingStore.swift
+@@ -461,10 +461,17 @@ final class RecordingStore: ObservableObject {
+     @discardableResult
+     func update(_ recording: Recording) -> Bool {
+         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return false }
++        let previousTitle = recordings[idx].title
+         recordings[idx] = recording
+         let transcriptWritten = writeTranscript(for: recording)
+         writeSummary(for: recording)
+         let persisted = persist()
++        // A completed recording's new title (the post-recording naming sheet,
++        // an automatic title) reaches its `.md` sidecar, whose front matter and
++        // heading carry it. A no-op unless the user enabled the sidecar.
++        if recording.title != previousTitle, recording.status == .completed {
++            MarkdownTranscriptExporter.writeSidecar(for: recording, in: recordingsDirectory)
++        }
+         return transcriptWritten && persisted
+     }
+ 
+@@ -626,6 +633,10 @@ final class RecordingStore: ObservableObject {
+         guard recordings[idx].title != trimmed else { return }
+         recordings[idx].title = trimmed
+         persist()
++        // Keep the `.md` sidecar's title and heading in step (a no-op unless enabled).
++        if recordings[idx].status == .completed {
++            MarkdownTranscriptExporter.writeSidecar(for: recordings[idx], in: recordingsDirectory)
++        }
+     }
+ 
+     /// Assign (or clear, with nil/empty) a display name for one raw
+@@ -1013,6 +1024,7 @@ final class RecordingStore: ObservableObject {
+         try? fileManager.removeItem(at: transcriptURL(for: recording))
+         try? fileManager.removeItem(at: summaryURL(for: recording))
+         try? fileManager.removeItem(at: subtitleURL(for: recording))
++        MarkdownTranscriptExporter.removeSidecar(for: recording, in: recordingsDirectory, fileManager: fileManager)
+         // Tombstone a deleted Voice-Memos import so the next sync doesn't
+         // resurrect it: the importer's dedup is keyed on the LIVE store, and
+         // the source memo still exists in the Voice Memos folder — deleting
+@@ -1052,6 +1064,7 @@ final class RecordingStore: ObservableObject {
+             try? fileManager.removeItem(at: transcriptURL(for: recording))
+             try? fileManager.removeItem(at: summaryURL(for: recording))
+             try? fileManager.removeItem(at: subtitleURL(for: recording))
++            MarkdownTranscriptExporter.removeSidecar(for: recording, in: recordingsDirectory, fileManager: fileManager)
+             if let memoID = recording.voiceMemoUniqueID {
+                 voiceMemoTombstones.insert(memoID)
+                 tombstonedAny = true
+diff --git a/Mila/Transcription/MarkdownTranscriptExporter.swift b/Mila/Transcription/MarkdownTranscriptExporter.swift
+new file mode 100644
+index 0000000..6116083
+--- /dev/null
++++ b/Mila/Transcription/MarkdownTranscriptExporter.swift
+@@ -0,0 +1,228 @@
++import Foundation
++import OSLog
++import MilaKit
++import TranscriptionCore
++
++// Same privacy rule as `TranscriptExporter`: the sidecar's name is derived from
++// the recording's TITLE, so it is `.private` and the recording's UUID is the
++// public correlation key. Transcript text is never logged.
++private let markdownLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
++                                 category: "MarkdownTranscriptExporter")
++
++/// Paragraph Markdown transcripts for a knowledge base: a `.md` sidecar next to
++/// each recording's `.srt`, the "Export Transcript (.md)…" command, and the
++/// vault-note content modes. The grouping/rendering itself lives in MilaKit's
++/// `ParagraphTranscriptFormatter`; this type adapts a `Recording` to it and
++/// owns the front matter and file I/O.
++///
++/// The `.srt` is still written (Mila's subtitle-video feature reads it); this
++/// is an additional file, never a replacement.
++enum MarkdownTranscriptExporter {
++
++    static let generatorName = "mila paragraph-transcript v1"
++    static let untitledTitle = "Untitled recording"
++
++    // MARK: - Document
++
++    /// The full Markdown document for `recording`: front matter, `# title`,
++    /// optional `## Summary`, `## Transcript`, and (only when the summary is
++    /// included) `## Action items`. Returns "" when there is no transcript
++    /// to render.
++    ///
++    /// Speaker labels go through `displaySpeakerName(names:language:)` so the
++    /// `.md`, the UI and the clipboard text agree ("Speaker A" / "דובר א׳" or
++    /// the name the user assigned).
++    ///
++    /// `timeZone` only affects the `date:` front-matter value; it is a
++    /// parameter so tests do not depend on the machine's zone.
++    static func document(for recording: Recording,
++                         includeSummary: Bool,
++                         timestamps: Bool = true,
++                         timeZone: TimeZone = .current) -> String {
++        let names = recording.speakerNames
++        let language = recording.language
++        let label: (String) -> String = { raw in
++            raw.displaySpeakerName(names: names, language: language)
++        }
++        let options = ParagraphTranscriptFormatter.Options(includeTimestamps: timestamps)
++
++        // `fallback` is an autoclosure in the formatter and is only read when
++        // no segment has text; keep the expression inline.
++        let body = ParagraphTranscriptFormatter.markdown(
++            segments: recording.segments,
++            fallback: recording.fullText,
++            label: label,
++            start: { $0.start },
++            end: { $0.end },
++            options: options
++        )
++        guard !body.isEmpty else { return "" }
++
++        let paragraphs = ParagraphTranscriptFormatter.paragraphs(
++            segments: recording.segments,
++            label: label,
++            start: { $0.start },
++            end: { $0.end },
++            options: options
++        )
++        var speakers: [String] = []
++        for paragraph in paragraphs {
++            if let name = paragraph.label, !speakers.contains(name) { speakers.append(name) }
++        }
++
++        let heading = ParagraphTranscriptFormatter.oneLine(recording.title)
++        let title = heading.isEmpty ? untitledTitle : heading
++
++        var front: [String] = ["---"]
++        front.append("title: \(jsonString(title))")
++        front.append("date: \(jsonString(isoDate(recording.createdAt, timeZone: timeZone)))")
++        front.append("duration: \(jsonString(clock(recording.duration)))")
++        front.append("language: \(jsonString(recording.language))")
++        front.append("source: \(jsonString(recording.source.rawValue))")
++        let app = ParagraphTranscriptFormatter.oneLine(recording.appName ?? "")
++        if !app.isEmpty {
++            front.append("app: \(jsonString(app))")
++        }
++        if !speakers.isEmpty {
++            front.append("speakers: [" + speakers.map(jsonString).joined(separator: ", ") + "]")
++        }
++        front.append("recording_id: \(jsonString(recording.id.uuidString))")
++        front.append("generator: \(jsonString(generatorName))")
++        front.append("---")
++
++        var blocks: [String] = [front.joined(separator: "\n"), "# \(title)"]
++
++        if includeSummary {
++            let summary = (recording.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
++            if !summary.isEmpty {
++                blocks.append("## Summary\n\n\(summary)")
++            }
++        }
++        blocks.append("## Transcript\n\n\(body)")
++        if includeSummary, let items = recording.actionItems, !items.isEmpty {
++            let lines = items.map { "- [ ] \(ParagraphTranscriptFormatter.oneLine($0.text))" }
++            blocks.append("## Action items\n\n" + lines.joined(separator: "\n"))
++        }
++        return blocks.joined(separator: "\n\n") + "\n"
++    }
++
++    /// The note body for the Obsidian exporter's transcript modes. The
++    /// upstream summary-else-transcript mode never comes through here.
++    static func vaultNote(for recording: Recording,
++                          content: MarkdownExportSettings.NoteContent,
++                          timestamps: Bool) -> String {
++        document(for: recording,
++                 includeSummary: content == .summaryAndTranscript,
++                 timestamps: timestamps)
++    }
++
++    // MARK: - Sidecar
++
++    /// `<audio file name minus extension>.md` in `directory` — the same
++    /// derivation as the `.srt` (`Recording.subtitleFileName`).
++    static func sidecarURL(for recording: Recording, in directory: URL) -> URL {
++        let name = (recording.audioFileName as NSString).deletingPathExtension + ".md"
++        return directory.appendingPathComponent(name)
++    }
++
++    /// Write the `.md` sidecar next to the recording's audio. A no-op unless
++    /// the sidecar setting is on (or `force` is set, for the "write Markdown
++    /// for existing recordings" backfill). Never throws; failures are logged
++    /// and the caller carries on, exactly like `TranscriptExporter.writeSRT`.
++    ///
++    /// The sidecar is the transcript only: the summary is generated after the
++    /// transcript sidecars are written, so including it here would leave a
++    /// file that is missing it (or stale) until some later rewrite.
++    ///
++    /// Returns true when a file was written.
++    @discardableResult
++    static func writeSidecar(for recording: Recording,
++                             in directory: URL,
++                             defaults: UserDefaults = .standard,
++                             force: Bool = false) -> Bool {
++        let settings = MarkdownExportSettings.current(defaults)
++        guard force || settings.sidecarEnabled else { return false }
++
++        let url = sidecarURL(for: recording, in: directory)
++        let body = document(for: recording,
++                            includeSummary: false,
++                            timestamps: settings.paragraphTimestamps)
++        guard !body.isEmpty else {
++            // Nothing to say any more (transcript cleared): do not leave a
++            // stale file behind. Same as the `.srt`.
++            try? FileManager.default.removeItem(at: url)
++            return false
++        }
++        let fileName = url.lastPathComponent
++        do {
++            try body.write(to: url, atomically: true, encoding: .utf8)
++            markdownLog.log("""
++                wrote Markdown transcript for \(recording.id, privacy: .public) \
++                (\(fileName, privacy: .private))
++                """)
++            return true
++        } catch {
++            let ns = error as NSError
++            markdownLog.error("""
++                failed to write Markdown transcript for \(recording.id, privacy: .public) \
++                (\(fileName, privacy: .private)) \
++                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
++                \(error.localizedDescription, privacy: .private)
++                """)
++            return false
++        }
++    }
++
++    /// Remove the `.md` sidecar, ignoring a missing file. Called wherever the
++    /// `.srt` is removed.
++    static func removeSidecar(for recording: Recording,
++                              in directory: URL,
++                              fileManager: FileManager = .default) {
++        try? fileManager.removeItem(at: sidecarURL(for: recording, in: directory))
++    }
++
++    // MARK: - Explicit export
++
++    /// Write the document to a user-chosen URL ("Export Transcript (.md)…").
++    /// The summary is included for `summaryElseTranscript` and
++    /// `summaryAndTranscript`, excluded for `transcript`. Throws so the caller
++    /// can show an alert; an empty transcript is an error, not an empty file.
++    static func write(for recording: Recording,
++                      to url: URL,
++                      defaults: UserDefaults = .standard) throws {
++        let settings = MarkdownExportSettings.current(defaults)
++        let body = document(for: recording,
++                            includeSummary: settings.noteContent != .transcript,
++                            timestamps: settings.paragraphTimestamps)
++        guard !body.isEmpty else {
++            throw NSError(domain: "MarkdownTranscriptExporter", code: 1,
++                          userInfo: [NSLocalizedDescriptionKey: "No transcript to export."])
++        }
++        try body.write(to: url, atomically: true, encoding: .utf8)
++    }
++
++    // MARK: - Formatting helpers
++
++    /// A JSON string literal, which is also a valid YAML double-quoted scalar
++    /// and keeps Hebrew as-is (JSONEncoder does not escape non-ASCII).
++    private static func jsonString(_ text: String) -> String {
++        let encoder = JSONEncoder()
++        encoder.outputFormatting = [.withoutEscapingSlashes]
++        guard let data = try? encoder.encode(text) else { return "\"\"" }
++        return String(decoding: data, as: UTF8.self)
++    }
++
++    private static func isoDate(_ date: Date, timeZone: TimeZone) -> String {
++        let formatter = ISO8601DateFormatter()
++        formatter.timeZone = timeZone
++        formatter.formatOptions = [.withInternetDateTime]
++        return formatter.string(from: date)
++    }
++
++    /// `HH:MM:SS` (hours do not wrap); 00:00:00 for a missing or invalid duration.
++    private static func clock(_ seconds: Double) -> String {
++        guard seconds.isFinite, seconds > 0 else { return "00:00:00" }
++        let whole = Int(min(seconds, 1_000_000_000).rounded())
++        return String(format: "%02d:%02d:%02d", whole / 3600, (whole % 3600) / 60, whole % 60)
++    }
++}
+diff --git a/Mila/Transcription/TranscriptExporter.swift b/Mila/Transcription/TranscriptExporter.swift
+index e594681..3ab6a60 100644
+--- a/Mila/Transcription/TranscriptExporter.swift
++++ b/Mila/Transcription/TranscriptExporter.swift
+@@ -12,6 +12,9 @@ enum TranscriptExporter {
+     /// transcription so every completed recording has a ready-to-share
+     /// .srt file alongside its .wav.
+     static func writeSRT(for recording: Recording, in directory: URL) {
++        // Also write the paragraph `.md` sidecar (a no-op unless the user
++        // enabled it); `defer` covers every return below.
++        defer { MarkdownTranscriptExporter.writeSidecar(for: recording, in: directory) }
+         let srtName = (recording.audioFileName as NSString).deletingPathExtension + ".srt"
+         let url = directory.appendingPathComponent(srtName)
+         let body = srtBody(for: recording)
+diff --git a/Mila/Views/MarkdownExportSettingsSection.swift b/Mila/Views/MarkdownExportSettingsSection.swift
+new file mode 100644
+index 0000000..fb0b7e1
+--- /dev/null
++++ b/Mila/Views/MarkdownExportSettingsSection.swift
+@@ -0,0 +1,80 @@
++import SwiftUI
++
++/// Markdown transcript section, embedded in the Storage settings tab next to
++/// the Obsidian section. Controls the `.md` sidecar written beside each
++/// recording, whether paragraphs carry timestamps, what Obsidian vault notes
++/// contain, and a one-shot backfill for recordings that already exist.
++struct MarkdownExportSettingsSection: View {
++    @EnvironmentObject private var settings: MarkdownExportSettings
++    @EnvironmentObject private var store: RecordingStore
++
++    @State private var isBackfilling = false
++    @State private var backfillResult: String?
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 10) {
++            HStack(alignment: .firstTextBaseline, spacing: 8) {
++                Image(systemName: "doc.plaintext")
++                    .foregroundStyle(.tint)
++                Text("Markdown transcripts")
++                    .font(.callout.weight(.semibold))
++                Spacer()
++            }
++            Toggle("Save a Markdown transcript (.md) next to each recording",
++                   isOn: $settings.sidecarEnabled)
++                .accessibilityIdentifier("markdownExport.sidecar.toggle")
++            Toggle("Timestamp each paragraph", isOn: $settings.paragraphTimestamps)
++                .accessibilityIdentifier("markdownExport.timestamps.toggle")
++            Picker("Notes in your vault contain", selection: $settings.noteContent) {
++                ForEach(MarkdownExportSettings.NoteContent.allCases, id: \.self) { content in
++                    Text(content.displayName).tag(content)
++                }
++            }
++            .accessibilityIdentifier("markdownExport.noteContent.picker")
++            HStack(spacing: 8) {
++                Button("Write Markdown for existing recordings") { backfill() }
++                    .disabled(isBackfilling)
++                    .accessibilityIdentifier("markdownExport.backfill.button")
++                if let backfillResult {
++                    Text(backfillResult)
++                        .font(.caption)
++                        .foregroundStyle(.secondary)
++                }
++            }
++            Text("The .srt subtitle file is still written next to each recording, because Mila's subtitle-video feature uses it.")
++                .font(.caption)
++                .foregroundStyle(.secondary)
++                .fixedSize(horizontal: false, vertical: true)
++        }
++        .padding(12)
++        .frame(maxWidth: .infinity, alignment: .leading)
++        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
++    }
++
++    /// Write a `.md` for every completed, non-trashed recording, whether or not
++    /// the sidecar toggle is on. The file I/O runs off the main thread; the
++    /// snapshot of recordings and the directory are taken first so nothing
++    /// main-actor-isolated is touched from the background task.
++    private func backfill() {
++        guard !isBackfilling else { return }
++        let recordings = store.recordings.filter { !$0.isTrashed && $0.status == .completed }
++        let directory = store.recordingsDirectory
++        isBackfilling = true
++        backfillResult = nil
++        Task { @MainActor in
++            let written = await Task.detached(priority: .utility) { () -> Int in
++                var count = 0
++                for recording in recordings {
++                    if MarkdownTranscriptExporter.writeSidecar(for: recording, in: directory, force: true) {
++                        count += 1
++                    }
++                }
++                return count
++            }.value
++            backfillResult = written == 0
++                ? "Nothing to write."
++                : "Wrote \(written) file\(written == 1 ? "" : "s")."
++            isBackfilling = false
++        }
++    }
++}
+diff --git a/Mila/Views/MarkdownTranscriptExportPanel.swift b/Mila/Views/MarkdownTranscriptExportPanel.swift
+new file mode 100644
+index 0000000..ba38787
+--- /dev/null
++++ b/Mila/Views/MarkdownTranscriptExportPanel.swift
+@@ -0,0 +1,30 @@
++import AppKit
++import UniformTypeIdentifiers
++
++/// The "Export Transcript (.md)…" save panel, shared by the history context
++/// menu and the recording detail toolbar so each of those views only carries
++/// the button itself. Same shape as their "Export Subtitles (.srt)…" panels:
++/// NSSavePanel, title as the suggested filename, NSAlert on failure.
++@MainActor
++enum MarkdownTranscriptExportPanel {
++
++    static func present(for recording: Recording) {
++        let panel = NSSavePanel()
++        panel.title = "Export Transcript"
++        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
++        panel.nameFieldStringValue = suggestedFileName(for: recording)
++        guard panel.runModal() == .OK, let url = panel.url else { return }
++        do {
++            try MarkdownTranscriptExporter.write(for: recording, to: url)
++        } catch {
++            NSAlert(error: error).runModal()
++        }
++    }
++
++    /// Sanitized title + `.md`; `Untitled recording.md` when the title has
++    /// nothing usable left after sanitizing.
++    static func suggestedFileName(for recording: Recording) -> String {
++        let safe = ObsidianPathSanitizer.nameFragment(recording.title)
++        return (safe.isEmpty ? MarkdownTranscriptExporter.untitledTitle : safe) + ".md"
++    }
++}
+diff --git a/Mila/Views/RecordingContextMenu.swift b/Mila/Views/RecordingContextMenu.swift
+index c438b38..9a53df7 100644
+--- a/Mila/Views/RecordingContextMenu.swift
++++ b/Mila/Views/RecordingContextMenu.swift
+@@ -154,6 +154,8 @@ private struct RecordingContextMenu: ViewModifier {
+                 exportSRT()
+             }
+             .disabled(recording.segments.isEmpty)
++            Button("Export Transcript (.md)…") { MarkdownTranscriptExportPanel.present(for: recording) }
++                .disabled(recording.segments.isEmpty && recording.fullText.isEmpty)
+             Button("Reveal in Finder") {
+                 NSWorkspace.shared.activateFileViewerSelecting([store.audioURL(for: recording)])
+             }
+diff --git a/Mila/Views/RecordingDetailView.swift b/Mila/Views/RecordingDetailView.swift
+index 54772fc..1027fcb 100644
+--- a/Mila/Views/RecordingDetailView.swift
++++ b/Mila/Views/RecordingDetailView.swift
+@@ -229,6 +229,15 @@ struct RecordingDetailView: View {
+             }
+             .disabled(recording.segments.isEmpty)
+             .help("Export subtitles (.srt) for the original video/audio")
++
++            // Markdown transcript export, next to the .srt button.
++            Button {
++                MarkdownTranscriptExportPanel.present(for: recording)
++            } label: {
++                Image(systemName: "doc.plaintext")
++            }
++            .disabled(recording.segments.isEmpty && recording.fullText.isEmpty)
++            .help("Export transcript (.md)")
+         }
+     }
+ 
+diff --git a/Mila/Views/StorageSettingsTab.swift b/Mila/Views/StorageSettingsTab.swift
+index b6ea1a2..78b1fcc 100644
+--- a/Mila/Views/StorageSettingsTab.swift
++++ b/Mila/Views/StorageSettingsTab.swift
+@@ -58,6 +58,7 @@ struct StorageSettingsTab: View {
+                 // done here (this is a container change only) — it's a
+                 // separate, reviewable UX call.
+                 ObsidianSettingsSection()
++                MarkdownExportSettingsSection()
+                 // Same reasoning as Obsidian above: an opt-in destination for
+                 // transcripts, one toggle wide until enabled, parked here
+                 // instead of a tab of its own.
+diff --git a/MilaTests/MarkdownExportSettingsTests.swift b/MilaTests/MarkdownExportSettingsTests.swift
+new file mode 100644
+index 0000000..14aeba1
+--- /dev/null
++++ b/MilaTests/MarkdownExportSettingsTests.swift
+@@ -0,0 +1,99 @@
++import XCTest
++@testable import Mila
++
++/// Every test uses its own `UserDefaults` suite; `.standard` is never touched.
++final class MarkdownExportSettingsTests: XCTestCase {
++
++    private var suiteName: String!
++    private var defaults: UserDefaults!
++
++    override func setUp() {
++        super.setUp()
++        suiteName = "MarkdownExportSettingsTests.\(UUID())"
++        defaults = UserDefaults(suiteName: suiteName)
++    }
++
++    override func tearDown() {
++        if let suiteName { defaults?.removePersistentDomain(forName: suiteName) }
++        super.tearDown()
++    }
++
++    func test_code_defaults_are_upstream_behaviour() {
++        let settings = MarkdownExportSettings(defaults: defaults)
++        XCTAssertFalse(settings.sidecarEnabled)
++        XCTAssertTrue(settings.paragraphTimestamps)
++        XCTAssertEqual(settings.noteContent, .summaryElseTranscript)
++
++        let snapshot = MarkdownExportSettings.current(defaults)
++        XCTAssertEqual(snapshot, MarkdownExportSettings.Snapshot(sidecarEnabled: false,
++                                                                 paragraphTimestamps: true,
++                                                                 noteContent: .summaryElseTranscript))
++    }
++
++    func test_keys_are_the_shared_contract() {
++        XCTAssertEqual(MarkdownExportSettings.sidecarEnabledKey, "markdownExport.sidecarEnabled")
++        XCTAssertEqual(MarkdownExportSettings.paragraphTimestampsKey, "markdownExport.paragraphTimestamps")
++        XCTAssertEqual(MarkdownExportSettings.noteContentKey, "markdownExport.noteContent")
++    }
++
++    func test_raw_values_are_the_shared_contract() {
++        XCTAssertEqual(MarkdownExportSettings.NoteContent.summaryElseTranscript.rawValue, "summaryElseTranscript")
++        XCTAssertEqual(MarkdownExportSettings.NoteContent.transcript.rawValue, "transcript")
++        XCTAssertEqual(MarkdownExportSettings.NoteContent.summaryAndTranscript.rawValue, "summaryAndTranscript")
++        XCTAssertEqual(MarkdownExportSettings.NoteContent.allCases.count, 3)
++    }
++
++    func test_changes_persist_under_the_namespaced_keys() {
++        let settings = MarkdownExportSettings(defaults: defaults)
++        settings.sidecarEnabled = true
++        settings.paragraphTimestamps = false
++        settings.noteContent = .summaryAndTranscript
++
++        XCTAssertEqual(defaults.object(forKey: "markdownExport.sidecarEnabled") as? Bool, true)
++        XCTAssertEqual(defaults.object(forKey: "markdownExport.paragraphTimestamps") as? Bool, false)
++        XCTAssertEqual(defaults.string(forKey: "markdownExport.noteContent"), "summaryAndTranscript")
++
++        let reloaded = MarkdownExportSettings(defaults: defaults)
++        XCTAssertTrue(reloaded.sidecarEnabled)
++        XCTAssertFalse(reloaded.paragraphTimestamps)
++        XCTAssertEqual(reloaded.noteContent, .summaryAndTranscript)
++
++        XCTAssertEqual(MarkdownExportSettings.current(defaults),
++                       MarkdownExportSettings.Snapshot(sidecarEnabled: true,
++                                                       paragraphTimestamps: false,
++                                                       noteContent: .summaryAndTranscript))
++    }
++
++    func test_an_unrecognised_note_content_falls_back_to_the_default() {
++        defaults.set("somethingElse", forKey: MarkdownExportSettings.noteContentKey)
++        XCTAssertEqual(MarkdownExportSettings.current(defaults).noteContent, .summaryElseTranscript)
++        XCTAssertEqual(MarkdownExportSettings(defaults: defaults).noteContent, .summaryElseTranscript)
++    }
++
++    func test_stored_values_are_honoured_and_a_later_choice_overrides_them() {
++        // Plain writes into the suite's own domain. Never `register(defaults:)` in a
++        // test — the registration domain is process-wide and leaks into every suite.
++        defaults.set(true, forKey: MarkdownExportSettings.sidecarEnabledKey)
++        defaults.set("summaryAndTranscript", forKey: MarkdownExportSettings.noteContentKey)
++        var snapshot = MarkdownExportSettings.current(defaults)
++        XCTAssertTrue(snapshot.sidecarEnabled)
++        XCTAssertTrue(snapshot.paragraphTimestamps, "an unset key keeps its code default")
++        XCTAssertEqual(snapshot.noteContent, .summaryAndTranscript)
++
++        defaults.set(false, forKey: MarkdownExportSettings.sidecarEnabledKey)
++        snapshot = MarkdownExportSettings.current(defaults)
++        XCTAssertFalse(snapshot.sidecarEnabled, "a later choice wins")
++    }
++
++    func test_setting_the_same_value_does_not_rewrite_defaults() {
++        let settings = MarkdownExportSettings(defaults: defaults)
++        settings.sidecarEnabled = false   // unchanged from the code default
++        XCTAssertNil(defaults.object(forKey: MarkdownExportSettings.sidecarEnabledKey))
++    }
++
++    func test_display_names_are_distinct_and_non_empty() {
++        let names = MarkdownExportSettings.NoteContent.allCases.map(\.displayName)
++        XCTAssertEqual(Set(names).count, names.count)
++        XCTAssertFalse(names.contains(""))
++    }
++}
+diff --git a/MilaTests/MarkdownTranscriptExporterTests.swift b/MilaTests/MarkdownTranscriptExporterTests.swift
+new file mode 100644
+index 0000000..0aff8d4
+--- /dev/null
++++ b/MilaTests/MarkdownTranscriptExporterTests.swift
+@@ -0,0 +1,404 @@
++import XCTest
++import TranscriptionCore
++@testable import Mila
++
++/// All content here is synthetic. Every `UserDefaults` is a private suite, so
++/// nothing reads or writes `.standard`.
++@MainActor
++final class MarkdownTranscriptExporterTests: XCTestCase {
++
++    private var tempRoot: URL!
++    private var suiteName: String!
++    private var defaults: UserDefaults!
++
++    /// 2026-01-02T12:00:00Z.
++    private static let fixtureDate = Date(timeIntervalSince1970: 1_767_355_200)
++    private static let fixtureID = UUID(uuidString: "6F1C0000-0000-0000-0000-000000000001")!
++    private static let plus3 = TimeZone(secondsFromGMT: 3 * 3600)!
++
++    override func setUpWithError() throws {
++        try super.setUpWithError()
++        tempRoot = TestSupport.makeTempRoot(label: "MarkdownTranscriptExporterTests")
++        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
++        suiteName = "MarkdownTranscriptExporterTests.\(UUID())"
++        defaults = UserDefaults(suiteName: suiteName)
++    }
++
++    override func tearDownWithError() throws {
++        if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
++        if let suiteName { defaults?.removePersistentDomain(forName: suiteName) }
++        try super.tearDownWithError()
++    }
++
++    // MARK: - Fixtures
++
++    private func diarized(title: String = "Weekly sync",
++                          language: String = "he",
++                          names: [String: String] = ["SPEAKER_00": "Dana"],
++                          summary: String? = nil,
++                          actionItems: [ActionItem]? = nil,
++                          appName: String? = "Zoom") -> Recording {
++        Recording(
++            id: Self.fixtureID,
++            title: title,
++            createdAt: Self.fixtureDate,
++            duration: 2537,
++            source: .meeting,
++            audioFileName: "Weekly sync.m4a",
++            status: .completed,
++            language: language,
++            segments: [
++                TranscriptSegment(start: 0, end: 5, text: " First sentence.", speaker: "SPEAKER_00"),
++                TranscriptSegment(start: 5, end: 10, text: "Second sentence.", speaker: "SPEAKER_00"),
++                TranscriptSegment(start: 12, end: 20, text: "Reply from the other person.", speaker: "SPEAKER_01"),
++            ],
++            fullText: "First sentence. Second sentence. Reply from the other person.",
++            appName: appName,
++            summary: summary,
++            actionItems: actionItems,
++            speakerNames: names
++        )
++    }
++
++    private func undiarized(fullText: String = "plain words",
++                            segments: [TranscriptSegment]? = nil) -> Recording {
++        Recording(
++            id: Self.fixtureID,
++            title: "Memo",
++            createdAt: Self.fixtureDate,
++            duration: 12,
++            source: .microphone,
++            audioFileName: "Memo.wav",
++            status: .completed,
++            language: "en",
++            segments: segments ?? [
++                TranscriptSegment(start: 3, end: 6, text: "Hello there."),
++                TranscriptSegment(start: 6, end: 9, text: "Second thought."),
++            ],
++            fullText: fullText
++        )
++    }
++
++    private func action(_ text: String) -> ActionItem {
++        ActionItem(id: UUID().uuidString, text: text, speaker: nil,
++                   timestampSeconds: 0, source: .llmInferred, addedAt: Date())
++    }
++
++    private func document(_ recording: Recording,
++                          includeSummary: Bool = false,
++                          timestamps: Bool = true) -> String {
++        MarkdownTranscriptExporter.document(for: recording,
++                                            includeSummary: includeSummary,
++                                            timestamps: timestamps,
++                                            timeZone: Self.plus3)
++    }
++
++    private var hebrewB: String {
++        "SPEAKER_01".displaySpeakerName(names: [:], language: "he")
++    }
++
++    // MARK: - Document shape
++
++    func test_document_full_shape() {
++        let expected = """
++            ---
++            title: "Weekly sync"
++            date: "2026-01-02T15:00:00+03:00"
++            duration: "00:42:17"
++            language: "he"
++            source: "meeting"
++            app: "Zoom"
++            speakers: ["Dana", "\(hebrewB)"]
++            recording_id: "6F1C0000-0000-0000-0000-000000000001"
++            generator: "mila paragraph-transcript v1"
++            ---
++
++            # Weekly sync
++
++            ## Transcript
++
++            **[00:00] Dana:** First sentence. Second sentence.
++
++            **[00:12] \(hebrewB):** Reply from the other person.
++
++            """
++        XCTAssertEqual(document(diarized()), expected)
++    }
++
++    func test_document_ends_with_exactly_one_newline() {
++        let doc = document(diarized())
++        XCTAssertTrue(doc.hasSuffix("\n"))
++        XCTAssertFalse(doc.hasSuffix("\n\n"))
++    }
++
++    func test_front_matter_date_uses_the_given_time_zone() {
++        let utc = MarkdownTranscriptExporter.document(for: diarized(), includeSummary: false,
++                                                      timeZone: TimeZone(identifier: "UTC")!)
++        XCTAssertTrue(utc.contains("date: \"2026-01-02T12:00:00Z\"\n"))
++        XCTAssertTrue(document(diarized()).contains("date: \"2026-01-02T15:00:00+03:00\"\n"))
++    }
++
++    func test_front_matter_values_are_json_strings_and_hebrew_is_not_escaped() {
++        let doc = document(diarized(title: "Q3 \"plan\" a/b שלום"))
++        XCTAssertTrue(doc.contains("title: \"Q3 \\\"plan\\\" a/b שלום\"\n"), doc)
++        XCTAssertTrue(doc.contains("\n# Q3 \"plan\" a/b שלום\n"), "the heading is the plain title")
++    }
++
++    func test_title_falls_back_when_empty_and_is_single_line() {
++        let blank = document(diarized(title: " \n "))
++        XCTAssertTrue(blank.contains("title: \"Untitled recording\"\n"))
++        XCTAssertTrue(blank.contains("\n# Untitled recording\n"))
++
++        let multi = document(diarized(title: "Two\nlines"))
++        XCTAssertTrue(multi.contains("\n# Two lines\n"))
++        XCTAssertTrue(multi.contains("title: \"Two lines\"\n"))
++    }
++
++    func test_app_key_only_when_app_name_is_non_empty() {
++        XCTAssertTrue(document(diarized(appName: "Zoom")).contains("app: \"Zoom\"\n"))
++        XCTAssertFalse(document(diarized(appName: nil)).contains("app:"))
++        XCTAssertFalse(document(diarized(appName: "  ")).contains("app:"))
++    }
++
++    func test_duration_is_hh_mm_ss_and_hours_do_not_wrap() {
++        var rec = diarized()
++        rec.duration = 3_725
++        XCTAssertTrue(document(rec).contains("duration: \"01:02:05\"\n"))
++        rec.duration = 360_000
++        XCTAssertTrue(document(rec).contains("duration: \"100:00:00\"\n"))
++        rec.duration = .nan
++        XCTAssertTrue(document(rec).contains("duration: \"00:00:00\"\n"))
++    }
++
++    // MARK: - Summary and action items
++
++    func test_summary_is_included_verbatim_before_the_transcript() {
++        let rec = diarized(summary: "We agreed to ship.\n- first\n- second")
++        let doc = document(rec, includeSummary: true)
++        XCTAssertTrue(doc.contains("## Summary\n\nWe agreed to ship.\n- first\n- second\n\n## Transcript"), doc)
++    }
++
++    func test_summary_is_left_out_when_not_included_or_empty() {
++        let rec = diarized(summary: "We agreed to ship.")
++        XCTAssertFalse(document(rec, includeSummary: false).contains("## Summary"))
++        XCTAssertFalse(document(diarized(summary: "  \n"), includeSummary: true).contains("## Summary"))
++        XCTAssertFalse(document(diarized(summary: nil), includeSummary: true).contains("## Summary"))
++    }
++
++    func test_action_items_follow_the_transcript_when_the_summary_is_included() {
++        let rec = diarized(summary: "S", actionItems: [action("Ship it"), action("Email\nSam")])
++        let doc = document(rec, includeSummary: true)
++        XCTAssertTrue(doc.hasSuffix("## Action items\n\n- [ ] Ship it\n- [ ] Email Sam\n"), doc)
++        let transcriptAt = doc.range(of: "## Transcript")
++        let itemsAt = doc.range(of: "## Action items")
++        XCTAssertNotNil(transcriptAt)
++        XCTAssertNotNil(itemsAt)
++        if let transcriptAt, let itemsAt {
++            XCTAssertLessThan(transcriptAt.lowerBound, itemsAt.lowerBound)
++        }
++    }
++
++    func test_action_items_are_left_out_when_the_summary_is_not_included() {
++        let rec = diarized(summary: "S", actionItems: [action("Ship it")])
++        XCTAssertFalse(document(rec, includeSummary: false).contains("Action items"))
++    }
++
++    // MARK: - Speaker labels
++
++    func test_hebrew_speaker_label_uses_display_speaker_name() {
++        let doc = document(diarized(language: "he", names: [:]))
++        let a = "SPEAKER_00".displaySpeakerName(names: [:], language: "he")
++        XCTAssertTrue(doc.contains("**[00:00] \(a):** First sentence."), doc)
++        XCTAssertTrue(a.hasPrefix("דובר"), "sanity: the Hebrew friendly label")
++    }
++
++    func test_english_speaker_label_and_assigned_name_wins() {
++        let plain = document(diarized(language: "en", names: [:]))
++        XCTAssertTrue(plain.contains("**[00:00] Speaker A:** First sentence."), plain)
++        XCTAssertTrue(plain.contains("**[00:12] Speaker B:**"), plain)
++        XCTAssertTrue(plain.contains("speakers: [\"Speaker A\", \"Speaker B\"]\n"))
++
++        let named = document(diarized(language: "en", names: ["SPEAKER_00": "Dana", "SPEAKER_01": "Lee"]))
++        XCTAssertTrue(named.contains("**[00:00] Dana:**"))
++        XCTAssertTrue(named.contains("**[00:12] Lee:**"))
++        XCTAssertFalse(named.contains("Speaker A"))
++    }
++
++    func test_speakers_are_listed_in_order_of_first_appearance_without_repeats() {
++        var rec = diarized(language: "en", names: [:])
++        rec.segments.append(TranscriptSegment(start: 30, end: 33, text: "And back again.", speaker: "SPEAKER_00"))
++        XCTAssertTrue(document(rec).contains("speakers: [\"Speaker A\", \"Speaker B\"]\n"))
++    }
++
++    // MARK: - Unlabelled, timestamps, empty
++
++    func test_unlabelled_transcript_has_no_label_and_no_speakers_key() {
++        let doc = document(undiarized())
++        XCTAssertTrue(doc.contains("**[00:03]** Hello there. Second thought.\n"), doc)
++        XCTAssertFalse(doc.contains("speakers:"))
++    }
++
++    func test_timestamps_off() {
++        let labelled = document(diarized(language: "en", names: [:]), timestamps: false)
++        XCTAssertTrue(labelled.contains("\n**Speaker A:** First sentence. Second sentence.\n"), labelled)
++        XCTAssertFalse(labelled.contains("[00:"))
++
++        let bare = document(undiarized(), timestamps: false)
++        XCTAssertTrue(bare.contains("\nHello there. Second thought.\n"), bare)
++    }
++
++    func test_text_only_recording_uses_the_full_text_fallback() {
++        let rec = undiarized(fullText: "just the sidecar text", segments: [])
++        let doc = document(rec)
++        XCTAssertTrue(doc.contains("**[time unavailable]** just the sidecar text\n"), doc)
++    }
++
++    func test_empty_transcript_gives_an_empty_document() {
++        XCTAssertEqual(document(undiarized(fullText: "", segments: [])), "")
++        XCTAssertEqual(document(undiarized(fullText: "  ",
++                                           segments: [TranscriptSegment(start: 0, end: 1, text: "  ")])), "")
++    }
++
++    // MARK: - Sidecar URL
++
++    func test_sidecar_url_swaps_the_extension_like_the_srt() {
++        let rec = diarized()
++        let md = MarkdownTranscriptExporter.sidecarURL(for: rec, in: tempRoot)
++        XCTAssertEqual(md.lastPathComponent, "Weekly sync.md")
++        XCTAssertEqual(md.deletingLastPathComponent().standardizedFileURL.path, tempRoot.standardizedFileURL.path)
++        XCTAssertEqual((rec.subtitleFileName as NSString).deletingPathExtension,
++                       (md.lastPathComponent as NSString).deletingPathExtension,
++                       "same stem as the .srt")
++    }
++
++    // MARK: - writeSidecar / removeSidecar
++
++    func test_write_sidecar_is_a_no_op_when_disabled() {
++        let rec = diarized()
++        let wrote = MarkdownTranscriptExporter.writeSidecar(for: rec, in: tempRoot, defaults: defaults)
++        XCTAssertFalse(wrote)
++        XCTAssertFalse(FileManager.default.fileExists(
++            atPath: MarkdownTranscriptExporter.sidecarURL(for: rec, in: tempRoot).path))
++    }
++
++    func test_write_sidecar_writes_the_transcript_when_enabled() throws {
++        defaults.set(true, forKey: MarkdownExportSettings.sidecarEnabledKey)
++        let rec = diarized(summary: "A summary that must not appear in the sidecar.")
++        let wrote = MarkdownTranscriptExporter.writeSidecar(for: rec, in: tempRoot, defaults: defaults)
++        XCTAssertTrue(wrote)
++        let url = MarkdownTranscriptExporter.sidecarURL(for: rec, in: tempRoot)
++        let text = try String(contentsOf: url, encoding: .utf8)
++        XCTAssertTrue(text.hasPrefix("---\ntitle: \"Weekly sync\"\n"))
++        XCTAssertTrue(text.contains("## Transcript"))
++        XCTAssertTrue(text.contains("First sentence. Second sentence."))
++        XCTAssertFalse(text.contains("## Summary"))
++    }
++
++    func test_write_sidecar_honours_the_timestamp_setting() throws {
++        defaults.set(true, forKey: MarkdownExportSettings.sidecarEnabledKey)
++        defaults.set(false, forKey: MarkdownExportSettings.paragraphTimestampsKey)
++        let rec = diarized(language: "en", names: [:])
++        MarkdownTranscriptExporter.writeSidecar(for: rec, in: tempRoot, defaults: defaults)
++        let text = try String(contentsOf: MarkdownTranscriptExporter.sidecarURL(for: rec, in: tempRoot),
++                              encoding: .utf8)
++        XCTAssertTrue(text.contains("**Speaker A:** First sentence."))
++        XCTAssertFalse(text.contains("[00:00]"))
++    }
++
++    func test_force_writes_even_when_the_setting_is_off() {
++        let rec = diarized()
++        let wrote = MarkdownTranscriptExporter.writeSidecar(for: rec, in: tempRoot,
++                                                            defaults: defaults, force: true)
++        XCTAssertTrue(wrote)
++        XCTAssertTrue(FileManager.default.fileExists(
++            atPath: MarkdownTranscriptExporter.sidecarURL(for: rec, in: tempRoot).path))
++    }
++
++    func test_write_sidecar_removes_a_stale_file_when_the_transcript_is_gone() throws {
++        defaults.set(true, forKey: MarkdownExportSettings.sidecarEnabledKey)
++        let rec = diarized()
++        MarkdownTranscriptExporter.writeSidecar(for: rec, in: tempRoot, defaults: defaults)
++        let url = MarkdownTranscriptExporter.sidecarURL(for: rec, in: tempRoot)
++        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
++
++        var emptied = rec
++        emptied.segments = []
++        emptied.fullText = ""
++        let wrote = MarkdownTranscriptExporter.writeSidecar(for: emptied, in: tempRoot, defaults: defaults)
++        XCTAssertFalse(wrote)
++        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
++    }
++
++    func test_remove_sidecar_deletes_the_file_and_tolerates_absence() throws {
++        let rec = diarized()
++        let url = MarkdownTranscriptExporter.sidecarURL(for: rec, in: tempRoot)
++        try "x".write(to: url, atomically: true, encoding: .utf8)
++        MarkdownTranscriptExporter.removeSidecar(for: rec, in: tempRoot)
++        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
++        MarkdownTranscriptExporter.removeSidecar(for: rec, in: tempRoot)   // second call: nothing to remove
++    }
++
++    /// Proves the one-line hook in `TranscriptExporter.writeSRT(for:in:)`. That
++    /// hook reads `.standard`, which this test only READS (it never writes it):
++    /// whatever value the host app has there, the sidecar must exist exactly
++    /// when it says so, and the `.srt` must be written either way.
++    func test_write_srt_hook_follows_the_standard_setting() {
++        let rec = diarized()
++        TranscriptExporter.writeSRT(for: rec, in: tempRoot)
++        let srt = tempRoot.appendingPathComponent(rec.subtitleFileName)
++        let md = MarkdownTranscriptExporter.sidecarURL(for: rec, in: tempRoot)
++        XCTAssertTrue(FileManager.default.fileExists(atPath: srt.path), "the .srt is still written")
++        XCTAssertEqual(FileManager.default.fileExists(atPath: md.path),
++                       MarkdownExportSettings.current().sidecarEnabled)
++    }
++
++    // MARK: - Export command
++
++    func test_write_to_url_includes_the_summary_by_default_mode() throws {
++        let rec = diarized(summary: "Short summary.", actionItems: [action("Do it")])
++        let url = tempRoot.appendingPathComponent("out.md")
++        try MarkdownTranscriptExporter.write(for: rec, to: url, defaults: defaults)
++        let text = try String(contentsOf: url, encoding: .utf8)
++        XCTAssertTrue(text.contains("## Summary\n\nShort summary."))
++        XCTAssertTrue(text.contains("- [ ] Do it"))
++    }
++
++    func test_write_to_url_excludes_the_summary_in_transcript_mode() throws {
++        defaults.set(MarkdownExportSettings.NoteContent.transcript.rawValue,
++                     forKey: MarkdownExportSettings.noteContentKey)
++        let rec = diarized(summary: "Short summary.", actionItems: [action("Do it")])
++        let url = tempRoot.appendingPathComponent("out.md")
++        try MarkdownTranscriptExporter.write(for: rec, to: url, defaults: defaults)
++        let text = try String(contentsOf: url, encoding: .utf8)
++        XCTAssertFalse(text.contains("## Summary"))
++        XCTAssertFalse(text.contains("Action items"))
++        XCTAssertTrue(text.contains("## Transcript"))
++    }
++
++    func test_write_to_url_includes_the_summary_in_summary_and_transcript_mode() throws {
++        defaults.set(MarkdownExportSettings.NoteContent.summaryAndTranscript.rawValue,
++                     forKey: MarkdownExportSettings.noteContentKey)
++        let rec = diarized(summary: "Short summary.")
++        let url = tempRoot.appendingPathComponent("out.md")
++        try MarkdownTranscriptExporter.write(for: rec, to: url, defaults: defaults)
++        XCTAssertTrue(try String(contentsOf: url, encoding: .utf8).contains("## Summary"))
++    }
++
++    func test_write_to_url_throws_for_an_empty_transcript_and_writes_nothing() {
++        let url = tempRoot.appendingPathComponent("none.md")
++        XCTAssertThrowsError(try MarkdownTranscriptExporter.write(
++            for: undiarized(fullText: "", segments: []), to: url, defaults: defaults)) { error in
++            XCTAssertEqual(error.localizedDescription, "No transcript to export.")
++        }
++        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
++    }
++
++    // MARK: - Save panel file name
++
++    func test_suggested_file_name_is_the_sanitized_title() {
++        var rec = diarized(title: "Q3 plan: a/b")
++        XCTAssertEqual(MarkdownTranscriptExportPanel.suggestedFileName(for: rec), "Q3 plan a b.md")
++        rec.title = "///"
++        XCTAssertEqual(MarkdownTranscriptExportPanel.suggestedFileName(for: rec), "Untitled recording.md")
++    }
++}
+diff --git a/MilaTests/RecordingTitleRefreshTests.swift b/MilaTests/RecordingTitleRefreshTests.swift
+new file mode 100644
+index 0000000..41af6a3
+--- /dev/null
++++ b/MilaTests/RecordingTitleRefreshTests.swift
+@@ -0,0 +1,175 @@
++import XCTest
++import TranscriptionCore
++@testable import Mila
++
++/// A completed recording's new title (`update(_:)` or `rename(_:to:)`) reaches
++/// its `.md` sidecar, whose front matter and heading carry the title.
++///
++/// `RecordingStore` reads the sidecar setting from `UserDefaults.standard` (its
++/// sidecar hooks take no injected defaults), so `setUp` switches
++/// `markdownExport.sidecarEnabled` on there and `tearDown` puts back exactly
++/// what was explicitly stored before (nothing, when the key was unset). Every
++/// recording and directory is synthetic.
++@MainActor
++final class RecordingTitleRefreshTests: XCTestCase {
++
++    private static let key = MarkdownExportSettings.sidecarEnabledKey
++
++    private var tempRoot: URL!
++    private var store: RecordingStore!
++    private var hadExplicitValue = false
++    private var explicitValue: Any?
++
++    override func setUpWithError() throws {
++        try super.setUpWithError()
++        tempRoot = TestSupport.makeTempRoot(label: "RecordingTitleRefreshTests")
++
++        let standard = UserDefaults.standard
++        if let domain = Bundle.main.bundleIdentifier,
++           let stored = standard.persistentDomain(forName: domain)?[Self.key] {
++            hadExplicitValue = true
++            explicitValue = stored
++        } else {
++            hadExplicitValue = false
++            explicitValue = nil
++        }
++        standard.set(true, forKey: Self.key)
++
++        store = RecordingStore(rootDirectory: tempRoot)
++    }
++
++    override func tearDown() {
++        let standard = UserDefaults.standard
++        if hadExplicitValue, let explicitValue {
++            standard.set(explicitValue, forKey: Self.key)
++        } else {
++            standard.removeObject(forKey: Self.key)
++        }
++        store = nil
++        if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
++        super.tearDown()
++    }
++
++    // MARK: - Fixtures
++
++    private func completed(title: String = "Weekly sync",
++                           status: TranscriptionStatus = .completed) -> Recording {
++        Recording(
++            title: title,
++            duration: 12,
++            source: .microphone,
++            audioFileName: "retitle-fixture.wav",
++            status: status,
++            language: "en",
++            segments: [
++                TranscriptSegment(start: 0, end: 5, text: "First sentence."),
++                TranscriptSegment(start: 5, end: 9, text: "Second sentence."),
++            ],
++            fullText: "First sentence. Second sentence."
++        )
++    }
++
++    private func sidecarText(for recording: Recording) -> String? {
++        let url = MarkdownTranscriptExporter.sidecarURL(for: recording, in: store.recordingsDirectory)
++        return try? String(contentsOf: url, encoding: .utf8)
++    }
++
++    // MARK: - update(_:)
++
++    func test_update_withChangedTitle_rewritesSidecar() {
++        var recording = completed()
++        store.add(recording)
++        XCTAssertNil(sidecarText(for: recording), "add() alone writes no .md sidecar")
++
++        recording.title = "Budget review"
++        store.update(recording)
++
++        let text = sidecarText(for: recording)
++        XCTAssertNotNil(text, "the sidecar is written with the new title")
++        XCTAssertTrue(text?.contains("# Budget review") ?? false)
++        XCTAssertTrue(text?.contains("title: \"Budget review\"") ?? false)
++    }
++
++    func test_update_overwritesAnExistingSidecarWithTheNewTitle() {
++        var recording = completed(title: "Old name")
++        store.add(recording)
++        MarkdownTranscriptExporter.writeSidecar(for: recording, in: store.recordingsDirectory)
++        XCTAssertTrue(sidecarText(for: recording)?.contains("# Old name") ?? false)
++
++        recording.title = "New name"
++        store.update(recording)
++
++        let text = sidecarText(for: recording)
++        XCTAssertTrue(text?.contains("# New name") ?? false)
++        XCTAssertFalse(text?.contains("Old name") ?? true)
++    }
++
++    func test_update_withUnchangedTitle_writesNoSidecar() {
++        var recording = completed()
++        store.add(recording)
++
++        recording.summary = "A summary arrived."   // any other change
++        store.update(recording)
++
++        XCTAssertNil(sidecarText(for: recording))
++    }
++
++    func test_update_withChangedTitle_onNonCompletedRecording_writesNoSidecar() {
++        for status in [TranscriptionStatus.pending, .failed] {
++            var recording = completed(status: status)
++            store.add(recording)
++
++            recording.title = "Renamed while \(status)"
++            store.update(recording)
++
++            XCTAssertNil(sidecarText(for: recording), "\(status) must not get a sidecar")
++        }
++    }
++
++    func test_update_forUnknownRecording_writesNoSidecar() {
++        var stranger = completed()
++        stranger.title = "Never stored"
++        XCTAssertFalse(store.update(stranger))
++        XCTAssertNil(sidecarText(for: stranger))
++    }
++
++    func test_updateRetiringSpeakerNames_overload_alsoRewritesSidecarOnRetitle() {
++        var recording = completed()
++        store.add(recording)
++
++        recording.title = "Via the overload"
++        store.update(recording, retiringSpeakerNames: [:])
++
++        XCTAssertTrue(sidecarText(for: recording)?.contains("# Via the overload") ?? false)
++    }
++
++    // MARK: - rename(_:to:)
++
++    func test_rename_rewritesSidecar_withTheTrimmedTitle() {
++        let recording = completed()
++        store.add(recording)
++
++        store.rename(recording, to: "  Renamed by hand  ")
++
++        XCTAssertTrue(sidecarText(for: recording)?.contains("# Renamed by hand") ?? false)
++    }
++
++    func test_rename_toTheSameOrBlankTitle_writesNoSidecar() {
++        let recording = completed()
++        store.add(recording)
++
++        store.rename(recording, to: recording.title)
++        store.rename(recording, to: "   ")
++
++        XCTAssertNil(sidecarText(for: recording))
++    }
++
++    func test_rename_onNonCompletedRecording_writesNoSidecar() {
++        let recording = completed(status: .pending)
++        store.add(recording)
++
++        store.rename(recording, to: "Renamed while pending")
++
++        XCTAssertNil(sidecarText(for: recording))
++    }
++}

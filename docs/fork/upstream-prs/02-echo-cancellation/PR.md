@@ -160,7 +160,7 @@ this exact patch series on top of `island-io/mila`
 commits here with `git am --3way`, runs the `swift test` suites of the local
 packages that have tests (MilaKit and the new EchoCancellation package), then
 `make project`, a Debug build of the `Mila` scheme, and the **full** `MilaTests`
-suite (not only the one class upstream's CI runs). Run: RUN_URL
+suite (not only the one class upstream's CI runs). Run: https://github.com/shircomay/mila-sandbox/actions/runs/38004705474
 
 New tests, all with synthetic audio, seeded generators and private
 `UserDefaults` suites:

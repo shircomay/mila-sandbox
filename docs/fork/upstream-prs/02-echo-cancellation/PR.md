@@ -2,7 +2,8 @@
 
 Closes #ISSUE_NUMBER
 
-> **Draft, and a question.** This is complete and CI-green, but it has **not**
+> **Draft, and a question.** This is complete and its full build and test
+> suite pass in CI (run linked below), but it has **not**
 > been tried with real speakers and a real microphone, and it adds a vendored C
 > library and touches the meeting-recording path. I would like to know whether
 > you want it in Mila before anyone spends review time on it. It is off by

@@ -1,4 +1,4 @@
-From f81186ff9122029670581f72d31928cefc21af91 Mon Sep 17 00:00:00 2001
+From e159641ba564b5d1bbdd13cc286a56dbb75e3515 Mon Sep 17 00:00:00 2001
 From: shircomay <112399495+shircomay@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 23:22:39 +0000
 Subject: [PATCH 4/4] docs(readme): note echo cancellation in the changelog

@@ -57,8 +57,7 @@ reference, before the mix, so the app audio stays in the recording once.
 - **Session flow.** `RecordingSession` feeds the app audio to the stage as the
   reference, mixes the stage's output instead of the raw microphone, flushes
   held microphone audio on pause and stop (and restarts the stage's timeline on
-  pause), and makes `stop()` close the WAV explicitly so it is complete on disk
-  when `stop()` returns. Once per recording it checks that the two capture
+  pause). Once per recording it checks that the two capture
   clocks agree (the assumption that ScreenCaptureKit stamps on the host clock is
   verified at run time); if they are more than 5 s apart it falls back to
   arrival order. A stage that cannot be created bypasses to today's behaviour

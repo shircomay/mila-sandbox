@@ -1,4 +1,4 @@
-From 7d39d0b346d17feced973d5258a3791767a670e1 Mon Sep 17 00:00:00 2001
+From 36ad5c86581cf09eec9d091caf8558a3cf88f110 Mon Sep 17 00:00:00 2001
 From: shircomay <112399495+shircomay@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 23:22:36 +0000
 Subject: [PATCH 3/4] feat(audio): echo-cancel the mic against app audio in
@@ -25,8 +25,7 @@ RecordingSession
 - Applies the adaptive gain to the cleaned samples (deferred gain, see the
   previous commit).
 - Flushes held microphone audio on pause and stop, and restarts the stage's
-  timeline on pause. stop() now also closes the WAV explicitly so the file is
-  complete on disk when it returns.
+  timeline on pause.
 - Once per recording, when both streams have produced a timestamp, checks that
   the two clocks agree. ScreenCaptureKit is assumed to stamp on the host time
   clock like AVAudioTime; if the two streams' timestamps are more than 5 s
@@ -57,13 +56,13 @@ Claude-Session: https://claude.ai/code/session_01D6Ni8F4iG4iXK8xfgdhSqe
  Mila/App/MilaApp.swift                        |   6 +
  Mila/Audio/AECDebugAudioWriter.swift          | 137 +++
  .../RecordingSession+EchoCancellation.swift   | 289 ++++++
- Mila/Audio/RecordingSession.swift             |  78 +-
+ Mila/Audio/RecordingSession.swift             |  75 +-
  Mila/Models/EchoCancellationSettings.swift    | 147 +++
  .../EchoCancellationSettingsSection.swift     |  51 ++
  Mila/Views/SettingsView.swift                 |   2 +
  MilaTests/EchoCancellationSettingsTests.swift | 174 ++++
- ...ecordingSessionEchoCancellationTests.swift | 846 ++++++++++++++++++
- 9 files changed, 1729 insertions(+), 1 deletion(-)
+ ...ecordingSessionEchoCancellationTests.swift | 866 ++++++++++++++++++
+ 9 files changed, 1746 insertions(+), 1 deletion(-)
  create mode 100644 Mila/Audio/AECDebugAudioWriter.swift
  create mode 100644 Mila/Audio/RecordingSession+EchoCancellation.swift
  create mode 100644 Mila/Models/EchoCancellationSettings.swift
@@ -555,7 +554,7 @@ index 0000000..f4791c4
 +    }
 +}
 diff --git a/Mila/Audio/RecordingSession.swift b/Mila/Audio/RecordingSession.swift
-index 81a2e75..245fa71 100644
+index 81a2e75..9c09a67 100644
 --- a/Mila/Audio/RecordingSession.swift
 +++ b/Mila/Audio/RecordingSession.swift
 @@ -100,6 +100,11 @@ final class RecordingSession: ObservableObject {
@@ -645,17 +644,7 @@ index 81a2e75..245fa71 100644
          await flushPendingSystemTail()
          recLog.log("stop: source=\(self.source.rawValue, privacy: .public) micFrames=\(micFrames, privacy: .public) systemBuffers=\(self.systemBuffersSinceStart, privacy: .public) writes=\(self.writesSinceStart, privacy: .public)")
          if (source == .microphone || source == .meeting) && micFrames == 0 {
-@@ -359,6 +404,9 @@ final class RecordingSession: ObservableObject {
-             recLog.error("recording stopped with 0 system-audio buffers (source=\(self.source.rawValue, privacy: .public)) — the app-audio leg delivered nothing")
-         }
-         let url = fileURL
-+        // Finalise the WAV now rather than whenever the file object is released,
-+        // so it is complete on disk when `stop()` returns.
-+        AECDebugAudioWriter.finish(audioFile)
-         audioFile = nil
-         fileURL = nil
-         startTime = nil
-@@ -389,6 +437,8 @@ final class RecordingSession: ObservableObject {
+@@ -389,6 +434,8 @@ final class RecordingSession: ObservableObject {
          meters.elapsed = 0
          isFakeForTesting = false
          pendingSystem.removeAll(keepingCapacity: false)
@@ -664,7 +653,7 @@ index 81a2e75..245fa71 100644
          state = .idle
      }
  
-@@ -398,6 +448,9 @@ final class RecordingSession: ObservableObject {
+@@ -398,6 +445,9 @@ final class RecordingSession: ObservableObject {
      /// buffers through the REAL mic path of a fake session and count who
      /// publishes; nothing in the app calls it from outside this file.
      func consumeMic(_ buffer: AVAudioPCMBuffer) async {
@@ -674,7 +663,7 @@ index 81a2e75..245fa71 100644
          // Paused: discard the buffer entirely so nothing reaches the WAV or
          // the live transcriber. The engine keeps running; we just drop its
          // output until `resume()`.
-@@ -416,6 +469,12 @@ final class RecordingSession: ObservableObject {
+@@ -416,6 +466,12 @@ final class RecordingSession: ObservableObject {
              await write(samples)
              return
          }
@@ -687,7 +676,7 @@ index 81a2e75..245fa71 100644
          // Meeting mode: the mic is the master clock. Each mic chunk pulls an
          // equal span of system audio out of `pendingSystem` (silence where
          // the app wasn't playing) and mixes the two, then drives BOTH the
-@@ -429,7 +488,10 @@ final class RecordingSession: ObservableObject {
+@@ -429,7 +485,10 @@ final class RecordingSession: ObservableObject {
          await write(mixed)
      }
  
@@ -699,7 +688,7 @@ index 81a2e75..245fa71 100644
          // Paused: drop system audio too (both the inline `.systemAudio`
          // write and the `.meeting` jitter-buffer append) so the paused span
          // is absent from the recording.
-@@ -444,6 +506,8 @@ final class RecordingSession: ObservableObject {
+@@ -444,6 +503,8 @@ final class RecordingSession: ObservableObject {
              await write(samples)
              return
          }
@@ -708,7 +697,7 @@ index 81a2e75..245fa71 100644
          // Meeting mode: park the system audio for the mic clock to consume
          // in `consumeMic`. Bound the backlog so a stalled mic clock can't grow
          // it without limit. The cap is generous (~30s), so an SCK burst at
-@@ -501,6 +565,18 @@ final class RecordingSession: ObservableObject {
+@@ -501,6 +562,18 @@ final class RecordingSession: ObservableObject {
          return mixed
      }
  
@@ -1132,10 +1121,10 @@ index 0000000..752c436
 +}
 diff --git a/MilaTests/RecordingSessionEchoCancellationTests.swift b/MilaTests/RecordingSessionEchoCancellationTests.swift
 new file mode 100644
-index 0000000..ec18c06
+index 0000000..f2a2a20
 --- /dev/null
 +++ b/MilaTests/RecordingSessionEchoCancellationTests.swift
-@@ -0,0 +1,846 @@
+@@ -0,0 +1,866 @@
 +import XCTest
 +import AVFoundation
 +import TranscriptionCore
@@ -1431,6 +1420,24 @@ index 0000000..ec18c06
 +        try AudioConvert.loadAsWhisperSamples(url: url)
 +    }
 +
++    /// `AVAudioFile` may not hand back the last partial 1024-frame block of a WAV
++    /// it wrote (see the note in `AudioConvertTests`), so a read-back is the
++    /// written audio minus at most 1023 trailing frames — never more, never extra.
++    private func assertReadBackCount(_ readBack: Int, wrote expected: Int, _ message: String = "",
++                                     file: StaticString = #filePath, line: UInt = #line) {
++        XCTAssertLessThanOrEqual(readBack, expected, "read back more than was written. \(message)", file: file, line: line)
++        XCTAssertGreaterThan(readBack, expected - 1024, "lost more than AVAudioFile's last partial block. \(message)",
++                             file: file, line: line)
++    }
++
++    /// `readBack` is `expected` up to AVAudioFile's trailing partial block, sample for sample.
++    private func assertReadBack(_ readBack: [Float], equals expected: [Float], _ message: String = "",
++                                file: StaticString = #filePath, line: UInt = #line) {
++        assertReadBackCount(readBack.count, wrote: expected.count, message, file: file, line: line)
++        let n = min(readBack.count, expected.count)
++        XCTAssertEqual(Array(readBack[0..<n]), Array(expected[0..<n]), message, file: file, line: line)
++    }
++
 +    private func debugAudio(for url: URL) throws -> (mic: [Float], ref: [Float], clean: [Float]) {
 +        let directory = AECDebugAudioWriter.directory(for: url)
 +        let base = url.deletingPathExtension().lastPathComponent
@@ -1444,11 +1451,13 @@ index 0000000..ec18c06
 +    /// debug audio dump (which, unlike the mix, does not depend on how the mixer
 +    /// happened to pair the two legs).
 +    private func steadyStateReduction(_ dump: (mic: [Float], ref: [Float], clean: [Float])) -> Double {
-+        guard dump.mic.count >= micCount, dump.clean.count >= micCount else {
++        // Up to 1023 trailing frames may be missing from a read-back (see `assertReadBackCount`).
++        let end = min(dump.mic.count, dump.clean.count, micCount)
++        guard end > micCount - 1_024 else {
 +            XCTFail("debug audio is shorter than the recording: \(dump.mic.count) / \(dump.clean.count) < \(micCount)")
 +            return -.infinity
 +        }
-+        return Synthetic.reductionDb(near: dump.mic, out: dump.clean, over: (micCount - 80_000)..<micCount)
++        return Synthetic.reductionDb(near: dump.mic, out: dump.clean, over: (end - 80_000)..<end)
 +    }
 +
 +    /// The part of the mix that came from the microphone: the mixer averages
@@ -1492,7 +1501,7 @@ index 0000000..ec18c06
 +        let cleanedMix = try samples(of: withStage.url)
 +
 +        // Nothing lost, nothing added: mic samples + the app-audio tail, as before.
-+        XCTAssertEqual(baselineMix.count, reference.count)
++        assertReadBackCount(baselineMix.count, wrote: reference.count)
 +        XCTAssertEqual(cleanedMix.count, baselineMix.count,
 +                       "the stage must not change how much audio is written")
 +
@@ -1602,7 +1611,7 @@ index 0000000..ec18c06
 +        // average with silence); everything else is the mic at full scale.
 +        // All 40 chunks of mic audio must have been written, none twice.
 +        let written = try samples(of: run.url)
-+        XCTAssertEqual(written.count, 40 * 1_365)
++        assertReadBackCount(written.count, wrote: 40 * 1_365)
 +        XCTAssertEqual(defaults.string(forKey: EchoCancellationSettings.Keys.lastSessionSummary)?
 +            .contains("clocks disagreed"), true,
 +                       "the Settings summary should say the clocks disagreed")
@@ -1676,8 +1685,8 @@ index 0000000..ec18c06
 +        _ = await run.session.stop()
 +
 +        XCTAssertEqual(live.samples, 80 * 1_365)
-+        XCTAssertEqual(try samples(of: run.url).count, 80 * 1_365,
-+                       "every mic sample outside the pause is in the WAV")
++        assertReadBackCount(try samples(of: run.url).count, wrote: 80 * 1_365,
++                            "every mic sample outside the pause is in the WAV")
 +    }
 +
 +    func test_system_timestamps_are_consumed_while_paused_too() async throws {
@@ -1718,7 +1727,7 @@ index 0000000..ec18c06
 +        let deferred = try await run(deferGain: true, gain: fixedGainFour(), label: "gain-deferred")
 +        let alreadyInTap = try await run(deferGain: false, gain: fixedGainFour(), label: "gain-in-tap")
 +
-+        XCTAssertEqual(plain.count, 64 * 1_365)
++        assertReadBackCount(plain.count, wrote: 64 * 1_365)
 +        XCTAssertEqual(deferred.count, plain.count)
 +        XCTAssertEqual(alreadyInTap.count, plain.count)
 +
@@ -1870,7 +1879,7 @@ index 0000000..ec18c06
 +
 +        let dump = try debugAudio(for: run.url)
 +        let written = try samples(of: run.url)
-+        XCTAssertEqual(dump.mic.count, chunks * 1_365)
++        assertReadBackCount(dump.mic.count, wrote: chunks * 1_365)
 +        XCTAssertEqual(dump.ref.count, dump.mic.count)
 +        XCTAssertEqual(dump.clean.count, dump.mic.count)
 +        XCTAssertEqual(written.count, dump.mic.count)
@@ -1906,10 +1915,10 @@ index 0000000..ec18c06
 +        let recorded = Array(mic[0..<(40 * 1_365)]) + Array(mic[(60 * 1_365)..<(100 * 1_365)])
 +        let dump = try debugAudio(for: run.url)
 +        let written = try samples(of: run.url)
-+        XCTAssertEqual(written.count, recorded.count)
-+        XCTAssertEqual(dump.mic.count, recorded.count)
-+        XCTAssertEqual(dump.ref.count, recorded.count)
-+        XCTAssertEqual(dump.clean.count, recorded.count)
++        assertReadBackCount(written.count, wrote: recorded.count)
++        XCTAssertEqual(dump.mic.count, written.count)
++        XCTAssertEqual(dump.ref.count, written.count)
++        XCTAssertEqual(dump.clean.count, written.count)
 +        var worstMic: Float = 0, worstClean: Float = 0
 +        for i in 0..<min(dump.mic.count, dump.clean.count, written.count, recorded.count) {
 +            worstMic = max(worstMic, abs(dump.mic[i] - recorded[i]))
@@ -1948,9 +1957,9 @@ index 0000000..ec18c06
 +        writer.close()                                                        // idempotent
 +
 +        let dump = try debugAudio(for: url)
-+        XCTAssertEqual(dump.mic, near)
-+        XCTAssertEqual(dump.ref, far)
-+        XCTAssertEqual(dump.clean, out)
++        assertReadBack(dump.mic, equals: near)
++        assertReadBack(dump.ref, equals: far)
++        assertReadBack(dump.clean, equals: out)
 +    }
 +
 +    /// The canceller's observer delivers chunks of 1...160 samples, not whole
@@ -1977,9 +1986,9 @@ index 0000000..ec18c06
 +        writer.close()
 +
 +        let dump = try debugAudio(for: url)
-+        XCTAssertEqual(dump.mic, near)
-+        XCTAssertEqual(dump.ref, far)
-+        XCTAssertEqual(dump.clean, out)
++        assertReadBack(dump.mic, equals: near)
++        assertReadBack(dump.ref, equals: far)
++        assertReadBack(dump.clean, equals: out)
 +    }
 +}
 -- 

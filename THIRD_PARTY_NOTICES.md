@@ -99,3 +99,55 @@ Full reproductions of the MIT, BSD-3-Clause, and Apache-2.0 license texts are av
 - Apache-2.0: https://www.apache.org/licenses/LICENSE-2.0
 
 If any attribution above is incomplete or incorrect, please open an issue on the Mila repository — we'll fix it.
+
+<!-- FORK: everything below this line is added by the personal fork (shircomay/mila-sandbox), not by upstream Mila. -->
+
+---
+
+## D. Fork additions
+
+### SpeexDSP echo canceller and preprocessor (BSD-3-Clause) <!-- FORK -->
+
+Vendored as C source in `Packages/EchoCancellation/Sources/CSpeexDSP` (acoustic echo cancellation of the microphone against the meeting audio, and residual-echo suppression). Compiled into the app by the local `EchoCancellation` Swift package.
+
+- Project: https://github.com/xiph/speexdsp (commit `7a158783df74efe7c2d1c6ee8363c1e695c71226`)
+- License: BSD-3-Clause (Xiph.Org Foundation licence, reproduced below and in `Packages/EchoCancellation/Sources/CSpeexDSP/COPYING`).
+- The vendored files are unmodified; see `Packages/EchoCancellation/Sources/CSpeexDSP/VENDORED.md`.
+
+```
+Copyright 2002-2008 	Xiph.org Foundation
+Copyright 2002-2008 	Jean-Marc Valin
+Copyright 2005-2007	Analog Devices Inc.
+Copyright 2005-2008	Commonwealth Scientific and Industrial Research
+                        Organisation (CSIRO)
+Copyright 1993, 2002, 2006 David Rowe
+Copyright 2003 		EpicGames
+Copyright 1992-1994	Jutta Degener, Carsten Bormann
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+- Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+- Neither the name of the Xiph.org Foundation nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```

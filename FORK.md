@@ -178,3 +178,4 @@ One row per upstream file with fork hooks (other specs append rows).
 | `Mila/Models/MilaConfigImporter.swift` | internal `obsidian`/`markdownExport` properties; `init` gains two defaulted trailing parameters; `plannedChanges` calls `knowledgeBaseChanges(for:)`; `apply` calls `applyKnowledgeBase(_:)` | 05 |
 | `Mila/Models/RecordingStore.swift` | `onCompletedRecordingRetitled` callback; `update(_:)` rewrites the `.md` sidecar and fires it when a completed recording's title changed; `rename(_:to:)` fires it after the sidecar rewrite | 05 |
 | `Mila/App/MilaApp.swift` | `MarkdownExportSettings` created before the importer (moved up from its later line); importer receives `obsidian:`/`markdownExport:`; `store.onCompletedRecordingRetitled` re-exports the KB note unless it is still pending | 05 |
+| `THIRD_PARTY_NOTICES.md` | New section "D. Fork additions" appended at the end, marked `<!-- FORK -->`: SpeexDSP (BSD-3-Clause) notice for the vendored echo canceller | 02 |

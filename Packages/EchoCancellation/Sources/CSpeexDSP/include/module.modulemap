@@ -1,0 +1,12 @@
+// Hand-written (not part of upstream SpeexDSP). An explicit module map rather
+// than SwiftPM's generated umbrella-directory map: the headers live in the
+// nested include/speex/ directory (so the vendored sources' own
+// `#include "speex/speex_echo.h"` keeps working), and speexdsp_types.h pulls in
+// speexdsp_config_types.h only on some platforms.
+module CSpeexDSP [system] {
+    header "speex/speexdsp_types.h"
+    header "speex/speex_echo.h"
+    header "speex/speex_preprocess.h"
+    textual header "speex/speexdsp_config_types.h"
+    export *
+}

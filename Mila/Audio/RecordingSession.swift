@@ -402,7 +402,6 @@ final class RecordingSession: ObservableObject {
             recLog.error("recording stopped with 0 system-audio buffers (source=\(self.source.rawValue, privacy: .public)) — the app-audio leg delivered nothing")
         }
         let url = fileURL
-        AECDebugAudioWriter.finish(audioFile) // FORK: finalise the WAV now, not whenever the object is released (spec 03)
         audioFile = nil
         fileURL = nil
         startTime = nil

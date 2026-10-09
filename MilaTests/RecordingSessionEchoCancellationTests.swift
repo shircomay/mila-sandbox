@@ -295,6 +295,24 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
         try AudioConvert.loadAsWhisperSamples(url: url)
     }
 
+    /// `AVAudioFile` may not hand back the last partial 1024-frame block of a WAV
+    /// it wrote (see the note in `AudioConvertTests`), so a read-back is the
+    /// written audio minus at most 1023 trailing frames — never more, never extra.
+    private func assertReadBackCount(_ readBack: Int, wrote expected: Int, _ message: String = "",
+                                     file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertLessThanOrEqual(readBack, expected, "read back more than was written. \(message)", file: file, line: line)
+        XCTAssertGreaterThan(readBack, expected - 1024, "lost more than AVAudioFile's last partial block. \(message)",
+                             file: file, line: line)
+    }
+
+    /// `readBack` is `expected` up to AVAudioFile's trailing partial block, sample for sample.
+    private func assertReadBack(_ readBack: [Float], equals expected: [Float], _ message: String = "",
+                                file: StaticString = #filePath, line: UInt = #line) {
+        assertReadBackCount(readBack.count, wrote: expected.count, message, file: file, line: line)
+        let n = min(readBack.count, expected.count)
+        XCTAssertEqual(Array(readBack[0..<n]), Array(expected[0..<n]), message, file: file, line: line)
+    }
+
     private func debugAudio(for url: URL) throws -> (mic: [Float], ref: [Float], clean: [Float]) {
         let directory = AECDebugAudioWriter.directory(for: url)
         let base = url.deletingPathExtension().lastPathComponent
@@ -308,11 +326,13 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
     /// debug audio dump (which, unlike the mix, does not depend on how the mixer
     /// happened to pair the two legs).
     private func steadyStateReduction(_ dump: (mic: [Float], ref: [Float], clean: [Float])) -> Double {
-        guard dump.mic.count >= micCount, dump.clean.count >= micCount else {
+        // Up to 1023 trailing frames may be missing from a read-back (see `assertReadBackCount`).
+        let end = min(dump.mic.count, dump.clean.count, micCount)
+        guard end > micCount - 1_024 else {
             XCTFail("debug audio is shorter than the recording: \(dump.mic.count) / \(dump.clean.count) < \(micCount)")
             return -.infinity
         }
-        return Synthetic.reductionDb(near: dump.mic, out: dump.clean, over: (micCount - 80_000)..<micCount)
+        return Synthetic.reductionDb(near: dump.mic, out: dump.clean, over: (end - 80_000)..<end)
     }
 
     /// The part of the mix that came from the microphone: the mixer averages
@@ -356,7 +376,7 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
         let cleanedMix = try samples(of: withStage.url)
 
         // Nothing lost, nothing added: mic samples + the app-audio tail, as upstream.
-        XCTAssertEqual(baselineMix.count, reference.count)
+        assertReadBackCount(baselineMix.count, wrote: reference.count)
         XCTAssertEqual(cleanedMix.count, baselineMix.count,
                        "the stage must not change how much audio is written")
 
@@ -466,7 +486,7 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
         // average with silence); everything else is the mic at full scale.
         // All 40 chunks of mic audio must have been written, none twice.
         let written = try samples(of: run.url)
-        XCTAssertEqual(written.count, 40 * 1_365)
+        assertReadBackCount(written.count, wrote: 40 * 1_365)
         XCTAssertEqual(defaults.string(forKey: EchoCancellationSettings.Keys.lastSessionSummary)?
             .contains("clocks disagreed"), true,
                        "the Settings summary should say the clocks disagreed")
@@ -540,8 +560,8 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
         _ = await run.session.stop()
 
         XCTAssertEqual(live.samples, 80 * 1_365)
-        XCTAssertEqual(try samples(of: run.url).count, 80 * 1_365,
-                       "every mic sample outside the pause is in the WAV")
+        assertReadBackCount(try samples(of: run.url).count, wrote: 80 * 1_365,
+                            "every mic sample outside the pause is in the WAV")
     }
 
     func test_system_timestamps_are_consumed_while_paused_too() async throws {
@@ -582,7 +602,7 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
         let deferred = try await run(deferGain: true, gain: fixedGainFour(), label: "gain-deferred")
         let alreadyInTap = try await run(deferGain: false, gain: fixedGainFour(), label: "gain-in-tap")
 
-        XCTAssertEqual(plain.count, 64 * 1_365)
+        assertReadBackCount(plain.count, wrote: 64 * 1_365)
         XCTAssertEqual(deferred.count, plain.count)
         XCTAssertEqual(alreadyInTap.count, plain.count)
 
@@ -734,7 +754,7 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
 
         let dump = try debugAudio(for: run.url)
         let written = try samples(of: run.url)
-        XCTAssertEqual(dump.mic.count, chunks * 1_365)
+        assertReadBackCount(dump.mic.count, wrote: chunks * 1_365)
         XCTAssertEqual(dump.ref.count, dump.mic.count)
         XCTAssertEqual(dump.clean.count, dump.mic.count)
         XCTAssertEqual(written.count, dump.mic.count)
@@ -770,10 +790,10 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
         let recorded = Array(mic[0..<(40 * 1_365)]) + Array(mic[(60 * 1_365)..<(100 * 1_365)])
         let dump = try debugAudio(for: run.url)
         let written = try samples(of: run.url)
-        XCTAssertEqual(written.count, recorded.count)
-        XCTAssertEqual(dump.mic.count, recorded.count)
-        XCTAssertEqual(dump.ref.count, recorded.count)
-        XCTAssertEqual(dump.clean.count, recorded.count)
+        assertReadBackCount(written.count, wrote: recorded.count)
+        XCTAssertEqual(dump.mic.count, written.count)
+        XCTAssertEqual(dump.ref.count, written.count)
+        XCTAssertEqual(dump.clean.count, written.count)
         var worstMic: Float = 0, worstClean: Float = 0
         for i in 0..<min(dump.mic.count, dump.clean.count, written.count, recorded.count) {
             worstMic = max(worstMic, abs(dump.mic[i] - recorded[i]))
@@ -812,9 +832,9 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
         writer.close()                                                        // idempotent
 
         let dump = try debugAudio(for: url)
-        XCTAssertEqual(dump.mic, near)
-        XCTAssertEqual(dump.ref, far)
-        XCTAssertEqual(dump.clean, out)
+        assertReadBack(dump.mic, equals: near)
+        assertReadBack(dump.ref, equals: far)
+        assertReadBack(dump.clean, equals: out)
     }
 
     /// The canceller's observer delivers chunks of 1...160 samples, not whole
@@ -841,8 +861,8 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
         writer.close()
 
         let dump = try debugAudio(for: url)
-        XCTAssertEqual(dump.mic, near)
-        XCTAssertEqual(dump.ref, far)
-        XCTAssertEqual(dump.clean, out)
+        assertReadBack(dump.mic, equals: near)
+        assertReadBack(dump.ref, equals: far)
+        assertReadBack(dump.clean, equals: out)
     }
 }

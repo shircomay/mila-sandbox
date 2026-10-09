@@ -610,6 +610,12 @@ struct MilaApp: App {
             obsidian.export(rec)
             obsidian.clearPending(rec.id)
         }
+        // FORK: spec 05 — a retitled completed recording renames its knowledge-base note.
+        // A pending note is skipped: the summary hook above writes it with the newest title.
+        store.onCompletedRecordingRetitled = { [weak obsidian, weak obsidianSettings] rec in
+            guard let obsidian, obsidianSettings?.enabled == true, !obsidian.isPending(rec.id) else { return }
+            obsidian.export(rec)
+        }
         // Wire the post-transcription summary hook. Fires for every
         // recording that the queue successfully completes — the
         // summarizer's own `shouldSummarize` gate skips work if a

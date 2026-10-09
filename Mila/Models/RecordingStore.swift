@@ -51,6 +51,11 @@ final class RecordingStore: ObservableObject {
     /// those two agree.
     var onSpeakerIDAbsorbed: ((_ recordingID: UUID, _ sourceRawID: String, _ targetRawID: String) -> Void)?
 
+    /// FORK: spec 05 — called after a COMPLETED recording's title changed
+    /// (`update(_:)` or `rename(_:to:)`), once the `.md` sidecar has been
+    /// rewritten. Lets the Obsidian exporter rename the knowledge-base note.
+    var onCompletedRecordingRetitled: ((Recording) -> Void)? // FORK: spec 05
+
     private let fileManager = FileManager.default
     /// `storeURL` and `foldersURL` move with `recordingsDirectory` on
     /// every `relocateRecordings` call. On the default path they live
@@ -461,10 +466,16 @@ final class RecordingStore: ObservableObject {
     @discardableResult
     func update(_ recording: Recording) -> Bool {
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return false }
+        let previousTitle = recordings[idx].title // FORK: spec 05
         recordings[idx] = recording
         let transcriptWritten = writeTranscript(for: recording)
         writeSummary(for: recording)
         let persisted = persist()
+        // FORK: spec 05 — a completed recording's new title reaches the .md sidecar and the KB note.
+        if recording.title != previousTitle, recording.status == .completed {
+            MarkdownTranscriptExporter.writeSidecar(for: recording, in: recordingsDirectory)
+            onCompletedRecordingRetitled?(recording)
+        }
         return transcriptWritten && persisted
     }
 
@@ -629,6 +640,7 @@ final class RecordingStore: ObservableObject {
         // FORK: keep the .md sidecar's title/heading in step (no-op unless enabled).
         if recordings[idx].status == .completed {
             MarkdownTranscriptExporter.writeSidecar(for: recordings[idx], in: recordingsDirectory)
+            onCompletedRecordingRetitled?(recordings[idx]) // FORK: spec 05 — rename the knowledge-base note too
         }
     }
 

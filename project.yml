@@ -137,6 +137,9 @@ packages:
     path: Packages/TranscriptionCore
   MilaKit:
     path: Packages/MilaKit
+  # FORK: acoustic echo cancellation for meeting recordings (spec 02 builds the package, spec 03 wires it in)
+  EchoCancellation:
+    path: Packages/EchoCancellation
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     revision: 066e75a8b3e99962685d6a90cdd5293ebffd9261
@@ -248,6 +251,9 @@ targets:
         product: TranscriptionCore
       - package: MilaKit
         product: MilaKit
+      # FORK: echo cancellation (spec 03)
+      - package: EchoCancellation
+        product: EchoCancellation
       - package: Sparkle
         product: Sparkle
       # Build-order only: the post-build script below copies the helper
@@ -308,6 +314,9 @@ targets:
         product: TranscriptionCore
       - package: MilaKit
         product: MilaKit
+      # FORK: echo cancellation (spec 03) — the integration tests build stages directly
+      - package: EchoCancellation
+        product: EchoCancellation
     settings:
       base:
         BUNDLE_LOADER: "$(TEST_HOST)"

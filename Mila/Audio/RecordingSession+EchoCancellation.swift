@@ -268,8 +268,9 @@ extension RecordingSession {
         do {
             let writer = try AECDebugAudioWriter(recordingURL: outputURL)
             echo.debugAudio = writer
-            // Fires on the main actor once per processed frame; `append` only
-            // hops onto the writer's own queue.
+            // Fires on the main actor with aligned chunks of 1...160 samples
+            // (out == what the stage returned); `append` only hops onto the
+            // writer's own queue.
             stage.frameObserver = { near, far, out in
                 writer.append(near: near, far: far, out: out)
             }

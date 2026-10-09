@@ -147,9 +147,14 @@ public final class EchoCancellationStage {
 
     public private(set) var statistics: Statistics
 
-    /// Debug tap: called once per processed frame with copies of near, the
-    /// aligned far frame actually used, and the output. nil by default; only
-    /// set it for debug dumps (it allocates per frame).
+    /// Debug tap. Each call passes three arrays of equal length k
+    /// (1 <= k <= frameSize): `out` is exactly the next k samples the stage
+    /// returns to its caller (latency-compensated), `near` / `far` the mic
+    /// input and the aligned reference those samples correspond to. Over a
+    /// session the concatenated `out` == everything `processMicrophone` and
+    /// `flush` returned, and the concatenated `near` == all mic input. Drain
+    /// frames contribute no samples. nil by default and free when nil; it
+    /// allocates per call, so only set it for debug dumps.
     public var frameObserver: ((_ near: [Float], _ far: [Float], _ out: [Float]) -> Void)?
 }
 ```
@@ -266,7 +271,9 @@ the true delay+lead after convergence.
 - Timestamps on an absurd basis (mic ≈ 1e6 s, ref ≈ 5 s): document behaviour
   (the app guards this, spec 03), must not crash or allocate unbounded memory.
 - Performance: 60 s of audio through the stage in < 3 s on CI (print the time).
-- `frameObserver` sees exactly `framesProcessed` callbacks with 160-sample arrays.
+- `frameObserver` reports aligned, latency-compensated chunks (1...frameSize samples, equal-length
+  arrays): concatenated `out` == everything returned, concatenated `near` == the mic input, for
+  backends with latency 0, 37 and one frame, across random chunking, `flush` and `resetTimeline`.
 
 ## Acceptance
 

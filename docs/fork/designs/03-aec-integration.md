@@ -162,7 +162,8 @@ automatic gain is shown in Settings):
 - At stop, build a one-line human summary from `statistics` and store it in
   `echoCancellation.lastSessionSummary` (no user content).
 - Debug audio (only when `saveDebugAudio` and a stage exists): set
-  `stage.frameObserver` to append near/far/out frames to three 16 kHz mono Float32
+  `stage.frameObserver` to append the observed near/far/out chunks (aligned,
+  1...160 samples each, `out` = what the stage returned) to three 16 kHz mono Float32
   WAV writers (`AVAudioFile`) under `<recordingsDirectory>/aec-debug/`, named from
   the recording's audio file base name + `.aec-mic.wav` / `.aec-ref.wav` /
   `.aec-clean.wav`. Derive the directory from `outputURL` (the WAV being

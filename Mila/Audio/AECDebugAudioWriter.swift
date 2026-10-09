@@ -14,9 +14,12 @@ private let aecDebugLog = Logger(subsystem: "io.island.whisper.IslandWhisper", c
 ///   * `<recording>.aec-clean.wav` the canceller's output
 ///
 /// The three files are sample-for-sample parallel, so any of them can be loaded
-/// alongside the others in an audio editor and compared directly.
+/// alongside the others in an audio editor and compared directly. The cleaned
+/// file is exactly what the canceller returned (before any gain the session
+/// applies afterwards), time-aligned with the other two and with the recording.
 ///
-/// The canceller's frame observer fires on the main actor, once per 10 ms frame.
+/// The canceller's frame observer fires on the main actor with chunks of 1 to
+/// 160 samples (the three arrays of a call always have the same length).
 /// `append` therefore only hops onto a private serial queue; the batching and
 /// the `AVAudioFile` writes happen there. Not used unless the user turned
 /// "Save echo-cancellation debug audio" on.
@@ -59,7 +62,8 @@ final class AECDebugAudioWriter: @unchecked Sendable {
         cleanFile = try makeFile("clean")
     }
 
-    /// One processed frame. Safe to call from any thread; returns immediately.
+    /// One observed chunk of any length (the three arrays have the same length).
+    /// Safe to call from any thread; returns immediately.
     func append(near: [Float], far: [Float], out: [Float]) {
         queue.async {
             self.pendingMic.append(contentsOf: near)

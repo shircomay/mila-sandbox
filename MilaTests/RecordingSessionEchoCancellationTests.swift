@@ -428,8 +428,10 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
         let dump = try debugAudio(for: run.url)
         let reduction = steadyStateReduction(dump)
         XCTAssertGreaterThanOrEqual(reduction, 10, "got \(reduction) dB")
-        XCTAssertEqual(stage.statistics.framesProcessed, micCount / 160,
-                       "every mic frame is processed exactly once")
+        // Every mic frame is processed exactly once. The Speex preprocessor delays its output by one
+        // frame, so the final flush feeds the stage one extra silence frame to drain it.
+        XCTAssertGreaterThanOrEqual(stage.statistics.framesProcessed, micCount / 160)
+        XCTAssertLessThanOrEqual(stage.statistics.framesProcessed, micCount / 160 + 1)
         let mix = try samples(of: run.url)
         XCTAssertGreaterThanOrEqual(mix.count, micCount, "no mic audio may be lost")
     }
@@ -715,11 +717,15 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
     // MARK: - Debug audio
 
     /// The three files are parallel, the raw mic is what went in, and the clean
-    /// file is what the mixer wrote (mic-only: no app audio, no gain).
+    /// file is what the mixer wrote (mic-only: no app audio). The debug "clean"
+    /// file is the canceller's output BEFORE gain, so gain must be identity here:
+    /// `deferGain: false` models a tap that already applied it, and the session
+    /// has no controller of its own to apply.
     func test_debug_audio_files_capture_the_raw_aligned_and_cleaned_streams() async throws {
         let chunks = 64                                                       // 87 360 samples = 546 whole frames
         let mic = Synthetic.speechLike(count: chunks * 1_365, seed: 41, targetRMS: 0.05)
         let run = try await makeSession(stage: try makeStage(),
+                                        deferGain: false,
                                         defaults: freshDefaults(saveDebugAudio: true),
                                         label: "debug-audio")
         let pump = Pump(session: run.session, mic: mic, reference: [])
@@ -732,11 +738,49 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
         XCTAssertEqual(dump.ref.count, dump.mic.count)
         XCTAssertEqual(dump.clean.count, dump.mic.count)
         XCTAssertEqual(written.count, dump.mic.count)
-        for i in stride(from: 0, to: dump.mic.count, by: 97) {
-            XCTAssertEqual(dump.mic[i], mic[i], accuracy: 1e-4, "raw mic at \(i)")
-            XCTAssertEqual(dump.ref[i], 0, accuracy: 1e-7, "no reference was delivered")
-            XCTAssertEqual(dump.clean[i], written[i], accuracy: 1e-6, "cleaned mic at \(i) is what the mixer wrote")
+        // Every sample, not a sample of them: a shift anywhere must fail.
+        var worstMic: Float = 0, worstRef: Float = 0, worstClean: Float = 0
+        for i in 0..<min(dump.mic.count, dump.ref.count, dump.clean.count, written.count, mic.count) {
+            worstMic = max(worstMic, abs(dump.mic[i] - mic[i]))
+            worstRef = max(worstRef, abs(dump.ref[i]))
+            worstClean = max(worstClean, abs(dump.clean[i] - written[i]))
         }
+        XCTAssertLessThan(worstMic, 1e-4, "raw mic is what went in, sample for sample")
+        XCTAssertLessThan(worstRef, 1e-7, "no reference was delivered")
+        XCTAssertLessThan(worstClean, 1e-6, "cleaned mic is what the mixer wrote, sample for sample")
+    }
+
+    /// A pause flushes the stage and restarts its timeline. The dump must stay
+    /// parallel and complete across it: exactly the audio that was recorded
+    /// (nothing from the paused span), with the clean file equal to the recording.
+    func test_debug_audio_stays_aligned_and_complete_across_a_pause() async throws {
+        let mic = Synthetic.speechLike(count: 100 * 1_365, seed: 43, targetRMS: 0.05)
+        let run = try await makeSession(stage: try makeStage(),
+                                        deferGain: false,
+                                        defaults: freshDefaults(saveDebugAudio: true),
+                                        label: "debug-pause")
+        let pump = Pump(session: run.session, mic: mic, reference: [])
+        await pump.advance(micChunks: 40)
+        await run.session.pause()
+        await pump.advance(micChunks: 20)                                    // dropped while paused
+        run.session.resume()
+        await pump.advance(micChunks: 40)
+        _ = await run.session.stop()
+
+        let recorded = Array(mic[0..<(40 * 1_365)]) + Array(mic[(60 * 1_365)..<(100 * 1_365)])
+        let dump = try debugAudio(for: run.url)
+        let written = try samples(of: run.url)
+        XCTAssertEqual(written.count, recorded.count)
+        XCTAssertEqual(dump.mic.count, recorded.count)
+        XCTAssertEqual(dump.ref.count, recorded.count)
+        XCTAssertEqual(dump.clean.count, recorded.count)
+        var worstMic: Float = 0, worstClean: Float = 0
+        for i in 0..<min(dump.mic.count, dump.clean.count, written.count, recorded.count) {
+            worstMic = max(worstMic, abs(dump.mic[i] - recorded[i]))
+            worstClean = max(worstClean, abs(dump.clean[i] - written[i]))
+        }
+        XCTAssertLessThan(worstMic, 1e-4, "raw mic is the audio outside the pause, in order")
+        XCTAssertLessThan(worstClean, 1e-6, "cleaned mic is the recording, across the pause")
     }
 
     func test_debug_audio_is_off_unless_asked_for() async throws {
@@ -766,6 +810,35 @@ final class RecordingSessionEchoCancellationTests: XCTestCase {
         }
         writer.close()
         writer.close()                                                        // idempotent
+
+        let dump = try debugAudio(for: url)
+        XCTAssertEqual(dump.mic, near)
+        XCTAssertEqual(dump.ref, far)
+        XCTAssertEqual(dump.clean, out)
+    }
+
+    /// The canceller's observer delivers chunks of 1...160 samples, not whole
+    /// frames: the writer must keep the three files parallel whatever the sizes.
+    func test_debug_writer_round_trips_chunks_of_any_length() throws {
+        let url = tempWAV("writer-variable")
+        let writer = try AECDebugAudioWriter(recordingURL: url)
+        let sizes = [1, 160, 37, 159, 160, 2, 100]
+        var near: [Float] = [], far: [Float] = [], out: [Float] = []
+        var next = 0
+        var k = 0
+        while near.count < 50_000 {                                           // > 3 batches
+            var n: [Float] = []
+            for _ in 0..<sizes[k % sizes.count] {
+                n.append(Float(next % 90_000) / 100_000)
+                next += 1
+            }
+            k += 1
+            writer.append(near: n, far: n.map { -$0 }, out: n.map { 2 * $0 })
+            near += n
+            far += n.map { -$0 }
+            out += n.map { 2 * $0 }
+        }
+        writer.close()
 
         let dump = try debugAudio(for: url)
         XCTAssertEqual(dump.mic, near)

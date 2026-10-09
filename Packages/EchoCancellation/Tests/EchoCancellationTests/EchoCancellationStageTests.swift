@@ -396,23 +396,225 @@ final class EchoCancellationStageTests: XCTestCase {
 
     // MARK: observer, statistics, custom backends
 
-    func test_frameObserver_seesEveryProcessedFrame() throws {
-        let stage = try makeStage()
+    // MARK: frame observer: aligned, latency-compensated chunks
+
+    /// Everything the observer saw, concatenated, plus the shape of each call.
+    private final class ObserverLog {
+        var near: [Float] = []
+        var far: [Float] = []
+        var out: [Float] = []
         var calls = 0
-        var wrongSizes = 0
-        var sawReference = false
-        stage.frameObserver = { near, far, out in
-            calls += 1
-            if near.count != 160 || far.count != 160 || out.count != 160 { wrongSizes += 1 }
-            if far.contains(where: { $0 != 0 }) { sawReference = true }
+        /// Calls whose arrays differ in length, are empty, or exceed the frame size.
+        var badShapes = 0
+        /// Samples where out != near - 0.5 * far (only meaningful for `DelayLineBackend`).
+        var wrongRelation = 0
+
+        func attach(to stage: EchoCancellationStage, frameSize: Int, checksRelation: Bool = false) {
+            stage.frameObserver = { [unowned self] near, far, out in
+                self.calls += 1
+                if near.isEmpty || near.count != far.count || near.count != out.count || near.count > frameSize {
+                    self.badShapes += 1
+                }
+                if checksRelation {
+                    for i in 0..<min(near.count, far.count, out.count)
+                    where abs(out[i] - (near[i] - 0.5 * far[i])) > 1e-6 {
+                        self.wrongRelation += 1
+                    }
+                }
+                self.near += near
+                self.far += far
+                self.out += out
+            }
         }
+    }
+
+    /// y = near - 0.5 * far, delayed by `latencySamples` (a stand-in for a backend with
+    /// algorithmic latency). With the stage's compensation, the observed `out` must equal
+    /// `near - 0.5 * far` of the SAME observed samples, for any latency.
+    private final class DelayLineBackend: EchoCancellerBackend {
+        let frameSize = 160
+        let latencySamples: Int
+        private var line: [Float]
+
+        init(latency: Int) {
+            latencySamples = latency
+            line = [Float](repeating: 0, count: latency)
+        }
+
+        func process(near: UnsafePointer<Float>, far: UnsafePointer<Float>, out: UnsafeMutablePointer<Float>) {
+            for i in 0..<frameSize { line.append(near[i] - 0.5 * far[i]) }
+            for i in 0..<frameSize { out[i] = line[i] }
+            line.removeFirst(frameSize)
+        }
+
+        func reset() { line = [Float](repeating: 0, count: latencySamples) }
+        func estimatedEchoDelayMs() -> Double? { return nil }
+    }
+
+    private enum Boundary { case flush, reset, flushThenReset }
+
+    /// Drives `stage` through 1...5 segments of random-length random audio, in random chunks
+    /// (1...1000 samples), ending each segment with `flush()`, `resetTimeline`, or both, and the
+    /// session with `flush()`. Each segment's whole reference is delivered before its microphone,
+    /// in contiguous mode, so with no lead the aligned far of a sample is exactly the reference
+    /// sample of the same index within its run (a run restarts at every `resetTimeline`).
+    /// Returns what the caller got back, the microphone input and the reference that was fed.
+    private func driveSegments(_ stage: EchoCancellationStage, seed: UInt64)
+        -> (returned: [Float], mic: [Float], reference: [Float]) {
+        var rng = SplitMix64(seed: seed)
+        var returned: [Float] = []
+        var mic: [Float] = []
+        var reference: [Float] = []
+        let segments = 1 + Int(rng.nextUInt64() % 5)
+        for _ in 0..<segments {
+            let length = 1 + Int(rng.nextUInt64() % 6000)
+            var segmentMic: [Float] = []
+            var segmentReference: [Float] = []
+            for _ in 0..<length {
+                segmentMic.append(Float(Double(rng.nextUInt64() % 2_000_001) / 2_000_000.0 - 0.5))
+                segmentReference.append(Float(Double(rng.nextUInt64() % 2_000_001) / 2_000_000.0 - 0.5))
+            }
+            mic += segmentMic
+            reference += segmentReference
+            stage.appendReference(segmentReference, hostTimeSeconds: nil)
+            var position = 0
+            while position < length {
+                let size = min(1 + Int(rng.nextUInt64() % 1000), length - position)
+                returned += stage.processMicrophone(Array(segmentMic[position..<(position + size)]), hostTimeSeconds: nil)
+                position += size
+            }
+            switch [Boundary.flush, .reset, .flushThenReset][Int(rng.nextUInt64() % 3)] {
+            case .flush:
+                returned += stage.flush()
+            case .reset:
+                stage.resetTimeline(resetFilter: rng.nextUInt64() % 2 == 0)
+            case .flushThenReset:
+                returned += stage.flush()
+                stage.resetTimeline(resetFilter: false)
+            }
+        }
+        returned += stage.flush()   // also hands out anything a trailing resetTimeline carried
+        return (returned, mic, reference)
+    }
+
+    private func assertObserverContract(_ label: String, _ log: ObserverLog, returned: [Float], mic: [Float],
+                                        file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertGreaterThan(log.calls, 0, label, file: file, line: line)
+        XCTAssertEqual(log.badShapes, 0, "\(label): every call has three equal-length arrays of 1...frameSize",
+                       file: file, line: line)
+        XCTAssertEqual(returned.count, mic.count, "\(label): length conservation", file: file, line: line)
+        XCTAssertTrue(log.out == returned, "\(label): observed out == everything the stage returned, in order",
+                      file: file, line: line)
+        XCTAssertTrue(log.near == mic, "\(label): observed near == all the microphone input, in order",
+                      file: file, line: line)
+        XCTAssertEqual(log.far.count, mic.count, "\(label): far is parallel to near", file: file, line: line)
+    }
+
+    func test_frameObserver_withLatencyBackends_isAlignedAndMatchesWhatTheCallerGets() throws {
+        // Latency 0, a non-multiple of the frame (37), exactly one frame (the Speex case), more than one.
+        for latency in [0, 37, 160, 400] {
+            for seed in 0..<12 {
+                var configuration = EchoCancellationStage.Configuration()
+                configuration.referenceLeadMs = 0
+                let stage = try XCTUnwrap(EchoCancellationStage(configuration: configuration,
+                                                                backend: DelayLineBackend(latency: latency)))
+                let log = ObserverLog()
+                log.attach(to: stage, frameSize: 160, checksRelation: true)
+                let run = driveSegments(stage, seed: UInt64(seed) &+ 7000)
+                let label = "latency \(latency), seed \(seed)"
+                assertObserverContract(label, log, returned: run.returned, mic: run.mic)
+                XCTAssertEqual(log.wrongRelation, 0, "\(label): out is the cleaned version of the SAME near/far samples")
+                XCTAssertTrue(log.far == run.reference, "\(label): far is the aligned reference of those samples")
+                // The returned signal itself, independent of the observer: returned[i] = mic[i] - 0.5 * reference[i].
+                for i in 0..<min(run.returned.count, run.mic.count)
+                where abs(run.returned[i] - (run.mic[i] - 0.5 * run.reference[i])) > 1e-6 {
+                    XCTFail("\(label): returned sample \(i) is not the cleaned sample \(i)")
+                    break
+                }
+            }
+        }
+    }
+
+    func test_frameObserver_withTheSpeexBackend_matchesWhatTheCallerGets() throws {
+        let speex = try XCTUnwrap(SpeexEchoCanceller(configuration: .init()))
+        XCTAssertEqual(speex.latencySamples, 160, "the default configuration has the one-frame preprocessor latency")
+        for seed in 0..<6 {
+            let backend = try XCTUnwrap(SpeexEchoCanceller(configuration: .init()))
+            let stage = try XCTUnwrap(EchoCancellationStage(configuration: .init(), backend: backend))
+            let log = ObserverLog()
+            log.attach(to: stage, frameSize: 160)
+            let run = driveSegments(stage, seed: UInt64(seed) &+ 9000)
+            assertObserverContract("speex, seed \(seed)", log, returned: run.returned, mic: run.mic)
+        }
+    }
+
+    func test_frameObserver_withTimestampsAndRealisticChunking_matchesWhatTheCallerGets() throws {
+        let stage = try makeStage()
+        let log = ObserverLog()
+        log.attach(to: stage, frameSize: 160)
         let count = 6 * sr
-        let out = StageFeeder.feed(stage: stage, mic: Array(scenario.micFarOnly[0..<count]),
-                                   reference: Array(scenario.far[0..<count]))
-        XCTAssertEqual(out.count, count)
-        XCTAssertEqual(calls, stage.statistics.framesProcessed)
-        XCTAssertEqual(wrongSizes, 0)
-        XCTAssertTrue(sawReference)
+        let mic = Array(scenario.micFarOnly[0..<count])
+        let out = StageFeeder.feed(stage: stage, mic: mic, reference: Array(scenario.far[0..<count]))
+        assertObserverContract("feeder", log, returned: out, mic: mic)
+        XCTAssertTrue(log.far.contains(where: { $0 != 0 }), "the reference reaches the observer")
+    }
+
+    func test_frameObserver_withTheSpeexBackend_reportsOutAlignedWithNear() throws {
+        // No reference: Speex only high-passes the microphone, so the observed out must be the
+        // DC-notched observed near at lag ZERO. The backend's raw output (the old contract) is a
+        // whole frame late and would not correlate.
+        let stage = try makeStage()
+        let log = ObserverLog()
+        log.attach(to: stage, frameSize: 160)
+        let mic = sum(scenario.near, scenario.noise)
+        let out = StageFeeder.feed(stage: stage, mic: mic, reference: [])
+        assertObserverContract("no reference", log, returned: out, mic: mic)
+        let correlation = Metrics.correlation(log.out, SyntheticEcho.dcNotch(log.near))
+        XCTAssertGreaterThan(correlation, 0.999)       // as in test_noReferenceEver_isTransparent: 0.99999
+        XCTAssertTrue(log.far.allSatisfy { $0 == 0 })
+    }
+
+    func test_frameObserver_setLate_reportsOnlyWhatItCanPair() throws {
+        for latency in [0, 37] {
+            var configuration = EchoCancellationStage.Configuration()
+            configuration.referenceLeadMs = 0
+            let stage = try XCTUnwrap(EchoCancellationStage(configuration: configuration,
+                                                            backend: DelayLineBackend(latency: latency)))
+            let signal = (0..<5000).map { Float(sin(Double($0) * 0.05)) * 0.5 }
+            stage.appendReference(signal, hostTimeSeconds: nil)
+            var returned = stage.processMicrophone(Array(signal[0..<1234]), hostTimeSeconds: nil)
+            let log = ObserverLog()
+            log.attach(to: stage, frameSize: 160, checksRelation: true)
+            returned += stage.processMicrophone(Array(signal[1234...]), hostTimeSeconds: nil)
+            returned += stage.flush()
+            XCTAssertEqual(returned.count, signal.count)
+            XCTAssertEqual(log.badShapes, 0)
+            XCTAssertEqual(log.wrongRelation, 0)
+            XCTAssertEqual(log.near.count, log.out.count)
+            XCTAssertGreaterThan(log.out.count, 0)
+            XCTAssertTrue(Array(signal.suffix(log.near.count)) == log.near, "latency \(latency): near is a suffix of the input")
+            XCTAssertTrue(Array(returned.suffix(log.out.count)) == log.out, "latency \(latency): out is a suffix of the output")
+        }
+    }
+
+    func test_frameObserver_unsetMidway_stopsReporting() throws {
+        var configuration = EchoCancellationStage.Configuration()
+        configuration.referenceLeadMs = 0
+        let stage = try XCTUnwrap(EchoCancellationStage(configuration: configuration,
+                                                        backend: DelayLineBackend(latency: 37)))
+        let log = ObserverLog()
+        log.attach(to: stage, frameSize: 160)
+        let signal = (0..<6000).map { Float(sin(Double($0) * 0.05)) * 0.5 }
+        stage.appendReference(signal, hostTimeSeconds: nil)
+        var returned = stage.processMicrophone(Array(signal[0..<2000]), hostTimeSeconds: nil)
+        stage.frameObserver = nil
+        let seen = log.out.count
+        returned += stage.processMicrophone(Array(signal[2000...]), hostTimeSeconds: nil)
+        returned += stage.flush()
+        XCTAssertEqual(returned.count, signal.count)
+        XCTAssertGreaterThan(seen, 0)
+        XCTAssertEqual(log.out.count, seen, "nothing is reported once the observer is nil")
+        XCTAssertTrue(Array(returned.prefix(seen)) == log.out)
     }
 
     func test_customBackend_isUsedAndItsLatencyCompensated() throws {

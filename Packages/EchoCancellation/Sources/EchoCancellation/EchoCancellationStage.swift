@@ -66,11 +66,25 @@ public final class EchoCancellationStage {
     public let configuration: Configuration
     public private(set) var statistics = Statistics()
 
-    /// Debug tap: called once per processed frame with copies of near, the
-    /// aligned far frame actually used, and the output. nil by default; only
-    /// set it for debug dumps (it allocates per frame). `out` is the backend's
-    /// raw output for that call, which for a backend with `latencySamples > 0`
-    /// is delayed by that many samples relative to `near`.
+    /// Debug tap, for dumping what the stage saw and produced. nil by default
+    /// and free when nil; set it only for debug dumps (it allocates per call).
+    ///
+    /// Each call passes three arrays of equal length k, 1 <= k <= the backend's
+    /// frame size. `out` is exactly the next k samples the stage hands to its
+    /// caller (from `processMicrophone`, `flush()`, or the output a
+    /// `resetTimeline` flushes and the next call returns), after the backend's
+    /// latency is compensated. `near` is the microphone input those samples
+    /// were computed from, and `far` the aligned reference the backend was fed
+    /// for them, so the three arrays are parallel, sample for sample.
+    ///
+    /// Over a session the concatenated `out` equals everything returned by
+    /// `processMicrophone` and `flush()`, in order, and the concatenated `near`
+    /// equals all the microphone input. The silence frames the stage feeds
+    /// internally to drain a backend's latency, and the zero padding of a final
+    /// partial frame, contribute no samples. Calls happen when the samples
+    /// leave the backend path, inside `processMicrophone`/`flush()`/
+    /// `resetTimeline`, never later. Set it before the first microphone sample;
+    /// samples that were produced while it was nil are not reported.
     public var frameObserver: ((_ near: [Float], _ far: [Float], _ out: [Float]) -> Void)?
 
     // Timestamps further than this from t0 (in samples) are ignored as absurd.
@@ -108,6 +122,16 @@ public final class EchoCancellationStage {
     private var skipRemaining: Int
     /// Output flushed by `resetTimeline`, handed out by the next call.
     private var carry: [Float] = []
+
+    // Observer bookkeeping (used only while `frameObserver` is set). Real mic
+    // samples fed to the backend, with the far samples fed alongside, that have
+    // not been reported yet: `pendingNear[i]` is the real input sample number
+    // `pendingFirstIndex + i` (numbered from the start of the stage's life,
+    // like `totalReturned`, which numbers the output samples the same way).
+    private var realFed = 0
+    private var pendingNear: [Float] = []
+    private var pendingFar: [Float] = []
+    private var pendingFirstIndex = 0
 
     // Preallocated frame buffers.
     private let nearFrame: UnsafeMutablePointer<Float>
@@ -243,12 +267,14 @@ public final class EchoCancellationStage {
             farFrame.update(repeating: 0, count: frameSize)
             var guardFrames = 0
             while produced.count < owed && guardFrames < EchoCancellationStage.maxDrainFrames {
-                runBackend(accountStatistics: false)
+                runBackend(accountStatistics: false, realCount: 0)
                 guardFrames += 1
             }
             result = takeProduced(count: owed)
         }
         produced.removeAll(keepingCapacity: true)   // padding beyond what is owed
+        pendingNear.removeAll(keepingCapacity: true)
+        pendingFar.removeAll(keepingCapacity: true)
         skipRemaining = latency                      // the next segment starts a fresh pipeline
         refreshStatistics()
         return withCarry(result)
@@ -338,7 +364,7 @@ public final class EchoCancellationStage {
     }
 
     private func processHeldFrame(at position: Int, referenceReady: Bool) {
-        _ = micQueue.pop(into: nearFrame, max: frameSize)
+        let real = micQueue.pop(into: nearFrame, max: frameSize)
         ring.read(from: position + leadSamples, count: frameSize, into: farFrame)
         var hasReference = false
         var i = 0
@@ -354,17 +380,22 @@ public final class EchoCancellationStage {
         } else if !referenceReady {
             statistics.framesHeldTooLong += 1
         }
-        runBackend(accountStatistics: true)
+        runBackend(accountStatistics: true, realCount: real)
         consumedReferenceEnd = position + leadSamples + frameSize
     }
 
     /// Runs the backend on nearFrame/farFrame -> outFrame and queues the output.
-    private func runBackend(accountStatistics: Bool) {
+    /// `realCount`: how many leading samples of the frame are real microphone
+    /// samples (a full frame, a partial last frame, or 0 for a drain frame).
+    private func runBackend(accountStatistics: Bool, realCount: Int) {
         backend.process(near: nearFrame, far: farFrame, out: outFrame)
         statistics.framesProcessed += 1
-        if let observer = frameObserver {
-            observer(copyOfFrame(nearFrame), copyOfFrame(farFrame), copyOfFrame(outFrame))
+        if frameObserver != nil && realCount > 0 {
+            if pendingNear.isEmpty { pendingFirstIndex = realFed }
+            pendingNear.append(contentsOf: UnsafeBufferPointer(start: UnsafePointer(nearFrame), count: realCount))
+            pendingFar.append(contentsOf: UnsafeBufferPointer(start: UnsafePointer(farFrame), count: realCount))
         }
+        realFed += realCount
         if accountStatistics {
             account()
         }
@@ -381,8 +412,40 @@ public final class EchoCancellationStage {
         }
     }
 
-    private func copyOfFrame(_ frame: UnsafeMutablePointer<Float>) -> [Float] {
-        return Array(UnsafeBufferPointer(start: UnsafePointer(frame), count: frameSize))
+    /// Reports `output` (the samples numbered `start...` that are leaving the
+    /// stage) to the observer, in chunks of at most `frameSize`, paired with
+    /// the real input they were computed from.
+    private func observe(_ output: [Float], startingAt start: Int) {
+        guard let observer = frameObserver else {
+            if !pendingNear.isEmpty {
+                pendingNear.removeAll(keepingCapacity: false)
+                pendingFar.removeAll(keepingCapacity: false)
+            }
+            return
+        }
+        // Input older than this output cannot be paired any more (it was
+        // recorded for output that has already left): forget it.
+        let stale = min(max(0, start - pendingFirstIndex), pendingNear.count)
+        if stale > 0 {
+            pendingNear.removeFirst(stale)
+            pendingFar.removeFirst(stale)
+            pendingFirstIndex += stale
+        }
+        // Output produced before the observer was set has no recorded input.
+        let skip = max(0, pendingFirstIndex - start)
+        let usable = min(output.count - skip, pendingNear.count)
+        guard usable > 0 else { return }
+        var offset = 0
+        while offset < usable {
+            let k = min(frameSize, usable - offset)
+            observer(Array(pendingNear[offset..<(offset + k)]),
+                     Array(pendingFar[offset..<(offset + k)]),
+                     Array(output[(skip + offset)..<(skip + offset + k)]))
+            offset += k
+        }
+        pendingNear.removeFirst(usable)
+        pendingFar.removeFirst(usable)
+        pendingFirstIndex += usable
     }
 
     /// Removes and returns the first `count` produced samples.
@@ -396,6 +459,7 @@ public final class EchoCancellationStage {
             result = Array(produced[0..<n])
             produced.removeFirst(n)
         }
+        if n > 0 { observe(result, startingAt: totalReturned) }
         totalReturned += n
         return withCarry(result)
     }

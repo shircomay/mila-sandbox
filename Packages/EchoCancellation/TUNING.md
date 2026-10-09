@@ -63,7 +63,7 @@ at gain 0.5, then an exponentially decaying Gaussian tail with RT60 250 ms holdi
    requirement with a default of 0) and `EchoCancellationStage` drops the first
    `latencySamples` output samples of a pipeline and drains the same number with
    silent frames in `flush()`, so callers still get exactly as many samples as they
-   put in, in place. `frameObserver` sees the raw (delayed) backend output.
+   put in, in place. `frameObserver` reports the compensated output, paired with the near/far samples it belongs to.
 3. **Speex high-passes the microphone even with no echo** (the DC notch at the input of
    `mdf.c`: −0.9 dB at 100 Hz, −3.9 dB at 60 Hz, −19.5 dB at 20 Hz, with phase shift up
    to ~500 Hz). Waveform SNR against the raw input is therefore only ≈7 dB for a

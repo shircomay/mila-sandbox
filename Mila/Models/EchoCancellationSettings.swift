@@ -12,11 +12,12 @@ import Combine
 /// real preferences.
 ///
 /// **Code defaults are the upstream behaviour: everything OFF.** The personal
-/// build switches echo cancellation on through `UserDefaults.register(defaults:)`
-/// (`ForkBuild.registerDefaults()`), which never overrides a value the user has
-/// set and which a test suite with its own `suiteName` never sees — so every
-/// read below is a plain `bool(forKey:)`, which honours registered defaults, and
-/// nothing here special-cases "unset".
+/// build switches echo cancellation on by writing the value into
+/// `UserDefaults.standard` for a key the user has not set yet
+/// (`ForkBuild.applyPersonalDefaults()`); this file never registers defaults
+/// (`register(defaults:)` is process-wide and would leak into every test suite).
+/// An unset key therefore means the code default, which is why every read goes
+/// through `object(forKey:)` rather than `bool(forKey:)`.
 ///
 /// `RecordingSession` reads these through the static helpers at record-start, so
 /// a change applies to the NEXT recording, never to one already running.
@@ -73,11 +74,16 @@ final class EchoCancellationSettings: ObservableObject {
     // MARK: - Reads/writes used outside the UI
 
     static func isEnabled(_ defaults: UserDefaults) -> Bool {
-        defaults.bool(forKey: Keys.enabled)
+        flag(Keys.enabled, in: defaults, codeDefault: false)
     }
 
     static func savesDebugAudio(_ defaults: UserDefaults) -> Bool {
-        defaults.bool(forKey: Keys.saveDebugAudio)
+        flag(Keys.saveDebugAudio, in: defaults, codeDefault: false)
+    }
+
+    /// An unset (or non-Bool) key means `codeDefault`.
+    private static func flag(_ key: String, in defaults: UserDefaults, codeDefault: Bool) -> Bool {
+        (defaults.object(forKey: key) as? Bool) ?? codeDefault
     }
 
     static func storedSessionSummary(_ defaults: UserDefaults) -> String? {

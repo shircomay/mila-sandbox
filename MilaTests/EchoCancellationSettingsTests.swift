@@ -2,7 +2,7 @@ import XCTest
 @testable import Mila
 
 /// FORK (echo cancellation, spec 03). The settings object, its UserDefaults
-/// contract (the keys are shared with the personal build's registered defaults)
+/// contract (the keys are shared with the personal build's default-applying code)
 /// and the one-line "Last meeting" summary.
 @MainActor
 final class EchoCancellationSettingsTests: XCTestCase {
@@ -19,7 +19,7 @@ final class EchoCancellationSettingsTests: XCTestCase {
     // MARK: - Defaults and persistence
 
     /// The code default is the upstream behaviour: nothing changes for a build
-    /// that does not register its own defaults.
+    /// that does not apply its own defaults.
     func test_everything_defaults_off_and_there_is_no_summary() {
         let defaults = freshDefaults()
         let settings = EchoCancellationSettings(defaults: defaults)
@@ -54,19 +54,34 @@ final class EchoCancellationSettingsTests: XCTestCase {
         XCTAssertFalse(EchoCancellationSettings.isEnabled(defaults))
     }
 
-    /// The personal build turns the feature on with `register(defaults:)`.
-    /// That must be visible to the settings object and to `isEnabled`, and must
-    /// never beat a value the user chose.
-    func test_registered_defaults_apply_but_never_override_the_user() {
+    /// The personal build turns the feature on by WRITING `true` into
+    /// `UserDefaults.standard` when the key is unset (`applyPersonalDefaults`).
+    /// From this class's side that is an ordinary stored value: it must be
+    /// honoured, and the user must be able to override it. (`register(defaults:)`
+    /// is deliberately not used anywhere — it is process-wide and would leak into
+    /// every suite.)
+    func test_a_value_written_for_an_unset_key_is_honoured_and_user_changes_win() {
         let defaults = freshDefaults()
-        defaults.register(defaults: ["echoCancellation.enabled": true])
-        XCTAssertTrue(EchoCancellationSettings.isEnabled(defaults), "registered default is honoured")
-        XCTAssertTrue(EchoCancellationSettings(defaults: defaults).enabled)
+        XCTAssertNil(defaults.object(forKey: "echoCancellation.enabled"), "precondition: unset")
 
+        defaults.set(true, forKey: "echoCancellation.enabled")        // what applyPersonalDefaults does
+        XCTAssertTrue(EchoCancellationSettings.isEnabled(defaults))
         let settings = EchoCancellationSettings(defaults: defaults)
-        settings.enabled = false
-        XCTAssertFalse(EchoCancellationSettings.isEnabled(defaults), "the user's explicit OFF wins")
+        XCTAssertTrue(settings.enabled)
+
+        settings.enabled = false                                      // the user turns it off
+        XCTAssertFalse(EchoCancellationSettings.isEnabled(defaults))
         XCTAssertFalse(EchoCancellationSettings(defaults: defaults).enabled)
+    }
+
+    /// Unset means the code default; a stray non-Bool value must not read as ON.
+    func test_unset_or_malformed_values_read_as_the_code_default() {
+        let defaults = freshDefaults()
+        XCTAssertFalse(EchoCancellationSettings.isEnabled(defaults))
+        defaults.set("yes", forKey: "echoCancellation.enabled")
+        XCTAssertFalse(EchoCancellationSettings.isEnabled(defaults), "a String is not a Bool")
+        defaults.set("yes", forKey: "echoCancellation.saveDebugAudio")
+        XCTAssertFalse(EchoCancellationSettings.savesDebugAudio(defaults))
     }
 
     // MARK: - Last-meeting summary

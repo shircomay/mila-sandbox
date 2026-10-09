@@ -30,7 +30,10 @@ final class AECDebugAudioWriter: @unchecked Sendable {
     /// from being called 100 times a second with 160 frames.
     private static let batchSamples = 16_000
 
-    private let queue = DispatchQueue(label: "io.island.mila.aec-debug-audio", qos: .utility)
+    // `.workItem`: release each work item's autoreleased objects when it ends, so
+    // a file dropped in `close()` is really gone (and flushed) when `close()` returns.
+    private let queue = DispatchQueue(label: "io.island.mila.aec-debug-audio", qos: .utility,
+                                      autoreleaseFrequency: .workItem)
     private var micFile: AVAudioFile?
     private var refFile: AVAudioFile?
     private var cleanFile: AVAudioFile?
@@ -78,11 +81,24 @@ final class AECDebugAudioWriter: @unchecked Sendable {
     /// when it returns. Idempotent.
     func close() {
         queue.sync {
-            drain()
-            micFile = nil
-            refFile = nil
-            cleanFile = nil
+            autoreleasepool {
+                drain()
+                Self.finish(micFile)
+                Self.finish(refFile)
+                Self.finish(cleanFile)
+                micFile = nil
+                refFile = nil
+                cleanFile = nil
+            }
         }
+    }
+
+    /// `AVAudioFile` only finalises a WAV (last buffered frames + header sizes)
+    /// when it is closed. Dropping the reference closes it on deallocation, which
+    /// can be deferred; `close()` (macOS 15+) does it now.
+    static func finish(_ file: AVAudioFile?) {
+        guard let file else { return }
+        if #available(macOS 15.0, *) { file.close() }
     }
 
     // MARK: - Queue-confined

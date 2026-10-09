@@ -120,7 +120,7 @@ this exact patch series on top of `island-io/mila` `605babbd5c2639841fc4ea366f9d
 at that commit, applies the four commits here with `git am --3way`, runs the
 `swift test` suites of the local packages that have tests (MilaKit) and then
 `make project`, a Debug build of the `Mila` scheme, and the **full** `MilaTests`
-suite (not only the one class upstream's CI runs). Run: RUN_URL
+suite (not only the one class upstream's CI runs). Run: https://github.com/shircomay/mila-sandbox/actions/runs/38001457732
 
 New tests, all with synthetic content and private `UserDefaults` suites:
 

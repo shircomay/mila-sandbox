@@ -393,7 +393,7 @@ struct MilaApp: App {
     @StateObject private var speakerProfileStore: SpeakerProfileStore
 
     init() {
-        ForkBuild.registerDefaults() // FORK: personal-build defaults, before any settings object reads them
+        if ForkBuild.isPersonalBuild { ForkBuild.applyPersonalDefaults() } // FORK: personal-build defaults, before any settings object reads them
         // RecordingStore's no-arg init handles the legacy migration and
         // opens at the default Application Support location. The
         // storage-settings instance owns the security-scoped bookmark

@@ -20,9 +20,9 @@ final class ForkBuildTests: XCTestCase {
         super.tearDown()
     }
 
-    func test_registerDefaults_setsPersonalBuildValues() {
+    func test_applyPersonalDefaults_setsPersonalBuildValues() {
         let defaults = makeSuite("set")
-        ForkBuild.registerDefaults(on: defaults)
+        ForkBuild.applyPersonalDefaults(on: defaults)
         XCTAssertTrue(defaults.bool(forKey: "markdownExport.sidecarEnabled"))
         XCTAssertTrue(defaults.bool(forKey: "markdownExport.paragraphTimestamps"))
         XCTAssertEqual(defaults.string(forKey: "markdownExport.noteContent"), "summaryAndTranscript")
@@ -32,21 +32,30 @@ final class ForkBuildTests: XCTestCase {
         XCTAssertNil(defaults.object(forKey: "echoCancellation.lastSessionSummary"))
     }
 
-    func test_registerDefaults_doesNotOverrideUserValues() {
+    func test_applyPersonalDefaults_doesNotOverrideUserValues() {
         let defaults = makeSuite("user")
         defaults.set(false, forKey: "markdownExport.sidecarEnabled")
         defaults.set("transcriptOnly", forKey: "markdownExport.noteContent")
-        ForkBuild.registerDefaults(on: defaults)
+        ForkBuild.applyPersonalDefaults(on: defaults)
         XCTAssertFalse(defaults.bool(forKey: "markdownExport.sidecarEnabled"))
         XCTAssertEqual(defaults.string(forKey: "markdownExport.noteContent"), "transcriptOnly")
         XCTAssertTrue(defaults.bool(forKey: "echoCancellation.enabled"))
     }
 
-    func test_registerDefaults_doesNotLeakToOtherSuites() {
-        let registered = makeSuite("registered")
+    func test_applyPersonalDefaults_doesNotLeakToOtherSuites() {
+        let applied = makeSuite("applied")
         let other = makeSuite("other")
-        ForkBuild.registerDefaults(on: registered)
+        ForkBuild.applyPersonalDefaults(on: applied)
         XCTAssertNil(other.object(forKey: "markdownExport.sidecarEnabled"))
         XCTAssertNil(other.object(forKey: "echoCancellation.enabled"))
+    }
+
+    func test_applyPersonalDefaults_isIdempotent_andKeepsLaterUserChoices() {
+        let defaults = makeSuite("idempotent")
+        ForkBuild.applyPersonalDefaults(on: defaults)
+        defaults.set(false, forKey: "echoCancellation.enabled")   // the owner turns it off
+        ForkBuild.applyPersonalDefaults(on: defaults)              // next launch
+        XCTAssertFalse(defaults.bool(forKey: "echoCancellation.enabled"))
+        XCTAssertTrue(defaults.bool(forKey: "markdownExport.sidecarEnabled"))
     }
 }

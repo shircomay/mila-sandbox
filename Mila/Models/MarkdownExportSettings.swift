@@ -13,10 +13,10 @@ import Combine
 /// thread.
 ///
 /// The code defaults are the upstream behaviour (sidecar OFF, summary else
-/// transcript). The personal build flips them with
-/// `UserDefaults.register(defaults:)`, which the readers here honour because
-/// they read with `object(forKey:)` / `string(forKey:)` rather than assuming
-/// "absent means false".
+/// transcript). The personal build flips them by writing values for unset
+/// keys at launch (`ForkBuild.applyPersonalDefaults`); the readers here use
+/// `object(forKey:)` / `string(forKey:)` rather than assuming "absent means
+/// false", so an unset key keeps its code default.
 final class MarkdownExportSettings: ObservableObject {
     static let sidecarEnabledKey = "markdownExport.sidecarEnabled"
     static let paragraphTimestampsKey = "markdownExport.paragraphTimestamps"

@@ -70,20 +70,20 @@ final class MarkdownExportSettingsTests: XCTestCase {
         XCTAssertEqual(MarkdownExportSettings(defaults: defaults).noteContent, .summaryElseTranscript)
     }
 
-    func test_registered_defaults_are_honoured_and_a_user_choice_overrides_them() {
-        // What the personal build does with `UserDefaults.register(defaults:)`.
-        defaults.register(defaults: [
-            MarkdownExportSettings.sidecarEnabledKey: true,
-            MarkdownExportSettings.noteContentKey: "summaryAndTranscript",
-        ])
+    func test_personal_defaults_written_by_the_fork_are_honoured_and_a_user_choice_overrides_them() {
+        // What the personal build does at launch (`ForkBuild.applyPersonalDefaults`):
+        // plain writes into the app's own domain. Never `register(defaults:)` in a
+        // test — the registration domain is process-wide and leaks into every suite.
+        defaults.set(true, forKey: MarkdownExportSettings.sidecarEnabledKey)
+        defaults.set("summaryAndTranscript", forKey: MarkdownExportSettings.noteContentKey)
         var snapshot = MarkdownExportSettings.current(defaults)
         XCTAssertTrue(snapshot.sidecarEnabled)
-        XCTAssertTrue(snapshot.paragraphTimestamps, "unregistered key keeps its code default")
+        XCTAssertTrue(snapshot.paragraphTimestamps, "an unset key keeps its code default")
         XCTAssertEqual(snapshot.noteContent, .summaryAndTranscript)
 
         defaults.set(false, forKey: MarkdownExportSettings.sidecarEnabledKey)
         snapshot = MarkdownExportSettings.current(defaults)
-        XCTAssertFalse(snapshot.sidecarEnabled, "a value the user set beats the registered default")
+        XCTAssertFalse(snapshot.sidecarEnabled, "the owner's later choice wins")
     }
 
     func test_setting_the_same_value_does_not_rewrite_defaults() {

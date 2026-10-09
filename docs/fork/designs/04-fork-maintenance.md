@@ -98,7 +98,7 @@ enum ForkBuild {
     static var isPersonalBuild: Bool
     /// Personal-build defaults (overview table). Only fills keys the user never
     /// set; never touches suites other than the one passed.
-    static func registerDefaults(on defaults: UserDefaults = .standard)
+    static func applyPersonalDefaults(on defaults: UserDefaults = .standard)  // was registerDefaults; see overview rule 6
 }
 ```
 
@@ -108,7 +108,7 @@ classes; do not import them).
 Hooks (`// FORK:` / `# FORK:`):
 - `project.yml`: add `MilaForkPersonalBuild: true` to the Mila target's
   `info.properties` (next to `CFBundleDisplayName`).
-- `MilaApp.init()`: first statement `ForkBuild.registerDefaults()` (before any
+- `MilaApp.init()`: first statement `ForkBuild.applyPersonalDefaults()` (before any
   settings object reads defaults).
 - Sparkle (`Mila/App/MilaApp.swift`, the updater wrapper around
   `SPUStandardUpdaterController`): `startingUpdater: !ForkBuild.isPersonalBuild`.
@@ -124,7 +124,7 @@ Hooks (`// FORK:` / `# FORK:`):
   replaces the official app in place and keeps the owner's recordings, settings
   and permissions location.
 
-Tests: `MilaTests/ForkBuildTests.swift` — registerDefaults on a custom suite sets
+Tests: `MilaTests/ForkBuildTests.swift` — applyPersonalDefaults on a custom suite sets
 the six keys' defaults, does not override a user-set value, and does not leak to
 another suite.
 

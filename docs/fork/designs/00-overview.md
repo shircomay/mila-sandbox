@@ -47,10 +47,12 @@ parallel; do not rely on anything in the package beyond that contract.
    `gcc`/`cc`; Python 3 is available.
 6. **Fork defaults vs upstream defaults.** New settings default to upstream
    behaviour (feature OFF) in code. The personal build switches them on through a
-   single registration point, `ForkBuild.registerDefaults()` (spec 04), using
-   `UserDefaults.register(defaults:)`. Registered defaults never override a value
-   the user set, and test suites with their own `suiteName` never see them. The
-   shared keys are fixed here so the specs stay in sync:
+   single point, `ForkBuild.applyPersonalDefaults()` (spec 04), which WRITES a
+   value for each key that has none yet in the app's own domain. (It first used
+   `UserDefaults.register(defaults:)`, but the registration domain is
+   process-wide and leaked into every test suite's isolated domain — never use
+   `register(defaults:)` for these keys, in code or tests.) A value the user set
+   is never overwritten. The shared keys are fixed here so the specs stay in sync:
 
    | Key | Type | Code default | Personal-build default |
    | --- | --- | --- | --- |

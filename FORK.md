@@ -21,7 +21,7 @@ Personal Mila = upstream Mila plus these features (specs in
 Fork code is additive (new files) with small upstream-file hooks marked
 `FORK:`; `git grep -n "FORK:"` lists every one. The personal build:
 
-- switches the fork features on by default (`ForkBuild.registerDefaults()`),
+- switches the fork features on by default (`ForkBuild.applyPersonalDefaults()`),
 - turns **Sparkle off**, so an official Mila update can never replace it; "Check
   for Updates…" explains that instead,
 - keeps the official bundle identifier and name, so it replaces the official app
@@ -161,7 +161,7 @@ One row per upstream file with fork hooks (other specs append rows).
 
 | File | Hook | Spec |
 | --- | --- | --- |
-| `Mila/App/MilaApp.swift` | `ForkBuild.registerDefaults()` as first statement of `MilaApp.init()` | 04 |
+| `Mila/App/MilaApp.swift` | `ForkBuild.applyPersonalDefaults()` (writes unset keys) as first statement of `MilaApp.init()` | 04 |
 | `Mila/App/MilaApp.swift` | `startingUpdater: !ForkBuild.isPersonalBuild` (Sparkle off in the personal build) | 04 |
 | `Mila/App/MilaApp.swift` | `UpdaterViewModel.checkForUpdates()` shows an alert and returns when personal | 04 |
 | `Mila/App/MilaApp.swift` | "Check for Updates…" stays enabled in the personal build (updater not started) | 04 |

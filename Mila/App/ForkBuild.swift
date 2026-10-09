@@ -1,11 +1,12 @@
 import Foundation
 
-/// Fork-only: marks this binary as the owner's personal build and registers the
+/// Fork-only: marks this binary as the owner's personal build and applies the
 /// personal-build defaults. See FORK.md and docs/fork/designs/04-fork-maintenance.md.
 ///
-/// Defaults are registered (not written): `register(defaults:)` only supplies a
-/// fallback for keys the user never set, lives in memory only, and never affects
-/// a `UserDefaults(suiteName:)` other than the one passed in.
+/// Defaults are WRITTEN into the given domain for keys that have no value yet,
+/// not registered: `UserDefaults.register(defaults:)` fills the process-wide
+/// registration domain, which every `UserDefaults(suiteName:)` also reads, so
+/// it leaked the personal defaults into the test suites' isolated domains.
 enum ForkBuild {
     /// Info.plist key written by project.yml (`MilaForkPersonalBuild: true`).
     static let infoPlistKey = "MilaForkPersonalBuild"
@@ -30,9 +31,13 @@ enum ForkBuild {
         "echoCancellation.saveDebugAudio": false,
     ]
 
-    /// Only fills keys the user never set; never touches suites other than the
-    /// one passed. Call before any settings object reads its defaults.
-    static func registerDefaults(on defaults: UserDefaults = .standard) {
-        defaults.register(defaults: personalDefaults)
+    /// Writes each personal default whose key has no value yet in `defaults`.
+    /// Never overwrites a value (the owner's own choices win) and never touches
+    /// any other domain. Idempotent; safe to call on every launch, so a default
+    /// added in a later fork version reaches existing installs too.
+    static func applyPersonalDefaults(on defaults: UserDefaults = .standard) {
+        for (key, value) in personalDefaults where defaults.object(forKey: key) == nil {
+            defaults.set(value, forKey: key)
+        }
     }
 }

@@ -17,9 +17,11 @@ on:
 permissions:
   contents: read
 
+# A newer push waits for the running build instead of cancelling it (only the
+# newest pending run is kept), so every finished run is a complete result.
 concurrency:
   group: fork-ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build-and-test:

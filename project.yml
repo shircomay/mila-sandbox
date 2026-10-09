@@ -179,6 +179,7 @@ targets:
       properties:
         CFBundleName: Mila
         CFBundleDisplayName: Mila
+        MilaForkPersonalBuild: true # FORK: personal build marker (ForkBuild.swift); disables Sparkle auto-update
         # Inherit from settings.MARKETING_VERSION / CURRENT_PROJECT_VERSION above
         # so a release bump only has to change those two fields. Hardcoding here
         # caused v1.2.4 to ship with build 6 instead of 7 — Sparkle's appcast

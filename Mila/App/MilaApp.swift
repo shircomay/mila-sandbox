@@ -79,7 +79,7 @@ final class UpdaterViewModel: NSObject, ObservableObject,
         // delegate. Starting the updater here kicks off the scheduled poll
         // (interval from `SUScheduledCheckInterval` in Info.plist).
         self.controller = SPUStandardUpdaterController(
-            startingUpdater: true,
+            startingUpdater: !ForkBuild.isPersonalBuild, // FORK: personal build never auto-updates
             updaterDelegate: self,
             userDriverDelegate: self
         )
@@ -119,6 +119,14 @@ final class UpdaterViewModel: NSObject, ObservableObject,
     /// User picked "Check for Updates…" from the menu. Flag it so the
     /// gentle-reminder delegate lets Sparkle's standard UI run, then check.
     func checkForUpdates() {
+        // FORK: personal build — explain instead of contacting the official feed.
+        if ForkBuild.isPersonalBuild {
+            let alert = NSAlert()
+            alert.messageText = "This is your personal Mila build"
+            alert.informativeText = "Official updates are turned off so they can't replace your custom features. New Mila releases arrive as an 'Upstream sync' pull request in your GitHub repository — see FORK.md."
+            alert.runModal()
+            return
+        }
         userInitiatedCheckInFlight = true
         controller.checkForUpdates(nil)
     }
@@ -384,6 +392,7 @@ struct MilaApp: App {
     @StateObject private var speakerProfileStore: SpeakerProfileStore
 
     init() {
+        ForkBuild.registerDefaults() // FORK: personal-build defaults, before any settings object reads them
         // RecordingStore's no-arg init handles the legacy migration and
         // opens at the default Application Support location. The
         // storage-settings instance owns the security-scoped bookmark
@@ -1086,7 +1095,7 @@ struct MilaApp: App {
                 Button("Check for Updates…") {
                     updater.checkForUpdates()
                 }
-                .disabled(!updater.canCheckForUpdates)
+                .disabled(!updater.canCheckForUpdates && !ForkBuild.isPersonalBuild) // FORK: updater is not started in the personal build; keep the item enabled to show the explanation
             }
             CommandGroup(replacing: .newItem) {
                 Button("New Voice Memo") {

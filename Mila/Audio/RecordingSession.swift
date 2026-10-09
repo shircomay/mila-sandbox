@@ -100,6 +100,11 @@ final class RecordingSession: ObservableObject {
     /// is why the live feed never starves the way the old mic/system
     /// pairing did.
     private var pendingSystem: [Float] = []
+    /// FORK: echo-cancellation state for the recording in progress (spec 03).
+    /// Logic lives in `RecordingSession+EchoCancellation.swift`; `echo.stage` is
+    /// nil — and every hook below a no-op — unless a MEETING recording started
+    /// with the setting on.
+    let echo = EchoCancellationSessionState()
     /// Cap on the system jitter buffer (~30s @ 16kHz). Generous so normal SCK
     /// bursts / clock skew just *delay* app audio (the mic clock catches back
     /// up) instead of losing it; only a genuinely stuck mic clock reaches the
@@ -143,6 +148,7 @@ final class RecordingSession: ObservableObject {
         // the last stop() ran its flush can append to `pendingSystem`
         // after the flush, and stop() doesn't clear the buffer.
         pendingSystem.removeAll(keepingCapacity: false)
+        beginEchoCancellation(source: source, outputURL: outputURL)  // FORK: stage + timestamp queues + deferred gain, BEFORE the mic starts (spec 03)
 
         do {
             let format = WhisperAudioFormat.pcmFloat32
@@ -205,6 +211,7 @@ final class RecordingSession: ObservableObject {
             audioFile = nil
             fileURL = nil
             pendingSystem.removeAll(keepingCapacity: false)
+            discardEchoCancellation()  // FORK: a failed bring-up must not leave a stage or armed queues behind (spec 03)
             throw error
         }
 
@@ -269,6 +276,11 @@ final class RecordingSession: ObservableObject {
         // Flip the gate FIRST so nothing else lands in `pendingSystem` while
         // the flush below awaits.
         state = .paused
+        // FORK: mic audio the echo canceller is still holding (it waits up to
+        // ~150 ms for the reference) is audio from BEFORE the pause — write it
+        // now, ahead of the system tail below, then restart the stage's timeline
+        // for whatever comes after resume (spec 03).
+        await mixAndWriteCleanedMic(echoFlushHeldMic())
         // Meeting mode parks system audio here for the mic clock to consume.
         // Whatever is parked at the pause instant is audio the other side
         // already produced BEFORE the pause, so write it out (system-only, at
@@ -332,6 +344,31 @@ final class RecordingSession: ObservableObject {
         startElapsedTimer()
     }
 
+    /// FORK (spec 03) test seam: like `startFakeForTesting`, but a MEETING
+    /// session that writes a real WAV, so a test can read back what the echo
+    /// canceller and the mixer produced. No mic or ScreenCaptureKit bring-up;
+    /// the test drives `consumeMic` / `consumeSystem` directly. Not used by the
+    /// app or by any upstream test.
+    func startFakeMeetingForTesting(outputURL: URL) async throws {
+        guard state == .idle else { return }
+        let format = WhisperAudioFormat.pcmFloat32
+        self.audioFile = try AVAudioFile(forWriting: outputURL, settings: format.settings,
+                                         commonFormat: .pcmFormatFloat32, interleaved: false)
+        self.source = .meeting
+        self.fileURL = outputURL
+        self.writesSinceStart = 0
+        self.systemBuffersSinceStart = 0
+        self.overflowFlushesSinceStart = 0
+        self.isFakeForTesting = true
+        pendingSystem.removeAll(keepingCapacity: false)
+        startTime = Date()
+        pausedAt = nil
+        totalPaused = 0
+        captureEpoch += 1
+        state = .recording
+        startElapsedTimer()
+    }
+
     func stop() async -> URL? {
         guard state == .recording || state == .paused else { return fileURL }
         state = .stopping
@@ -347,6 +384,12 @@ final class RecordingSession: ObservableObject {
         systemTask?.cancel(); systemTask = nil
         timerTask?.cancel(); timerTask = nil
 
+        // FORK: write the mic audio the echo canceller is still holding, THEN
+        // log its statistics, store the Settings summary and release it — all
+        // before the system tail goes out (spec 03). `write` does not look at
+        // `state`, so doing this while `.stopping` is fine.
+        await mixAndWriteCleanedMic(echoFlushHeldMic())
+        finishEchoCancellation()
         await flushPendingSystemTail()
         recLog.log("stop: source=\(self.source.rawValue, privacy: .public) micFrames=\(micFrames, privacy: .public) systemBuffers=\(self.systemBuffersSinceStart, privacy: .public) writes=\(self.writesSinceStart, privacy: .public)")
         if (source == .microphone || source == .meeting) && micFrames == 0 {
@@ -389,6 +432,7 @@ final class RecordingSession: ObservableObject {
         meters.elapsed = 0
         isFakeForTesting = false
         pendingSystem.removeAll(keepingCapacity: false)
+        discardEchoCancellation()  // FORK: drop the stage and disarm the queues; no writes (spec 03)
         state = .idle
     }
 
@@ -398,6 +442,9 @@ final class RecordingSession: ObservableObject {
     /// buffers through the REAL mic path of a fake session and count who
     /// publishes; nothing in the app calls it from outside this file.
     func consumeMic(_ buffer: AVAudioPCMBuffer) async {
+        // FORK: pop THIS buffer's capture timestamp before any early return, so the
+        // queue stays aligned with the stream even for buffers dropped while paused.
+        let micTimestamp = mic.timestamps.pop()
         // Paused: discard the buffer entirely so nothing reaches the WAV or
         // the live transcriber. The engine keeps running; we just drop its
         // output until `resume()`.
@@ -416,6 +463,12 @@ final class RecordingSession: ObservableObject {
             await write(samples)
             return
         }
+        // FORK: echo-cancel the mic against the app audio BEFORE mixing (spec 03).
+        // `nil` = no stage for this recording → fall through to the upstream path.
+        if let clean = echoProcessMic(samples, hostTime: micTimestamp) {
+            await mixAndWriteCleanedMic(clean)
+            return
+        }
         // Meeting mode: the mic is the master clock. Each mic chunk pulls an
         // equal span of system audio out of `pendingSystem` (silence where
         // the app wasn't playing) and mixes the two, then drives BOTH the
@@ -429,7 +482,9 @@ final class RecordingSession: ObservableObject {
         await write(mixed)
     }
 
-    private func consumeSystem(_ buffer: AVAudioPCMBuffer) async {
+    func consumeSystem(_ buffer: AVAudioPCMBuffer) async {  // FORK: internal for tests (was private)
+        // FORK: pop THIS buffer's capture timestamp before the pause gate (spec 03).
+        let systemTimestamp = system.timestamps.pop()
         // Paused: drop system audio too (both the inline `.systemAudio`
         // write and the `.meeting` jitter-buffer append) so the paused span
         // is absent from the recording.
@@ -444,6 +499,7 @@ final class RecordingSession: ObservableObject {
             await write(samples)
             return
         }
+        echoAppendReference(samples, hostTime: systemTimestamp)  // FORK: the same audio is the echo canceller's reference; no-op without a stage (spec 03)
         // Meeting mode: park the system audio for the mic clock to consume
         // in `consumeMic`. Bound the backlog so a stalled mic clock can't grow
         // it without limit. The cap is generous (~30s), so an SCK burst at
@@ -499,6 +555,18 @@ final class RecordingSession: ObservableObject {
         }
         if take > 0 { pendingSystem.removeFirst(take) }
         return mixed
+    }
+
+    /// FORK (spec 03): mix a chunk of echo-cancelled mic audio with the buffered
+    /// system audio and send the result to the live feed and the WAV — exactly
+    /// what `consumeMic` does with a raw chunk, for audio that came out of the
+    /// echo canceller instead. The chunk can be any length, including empty (the
+    /// canceller holds frames until their reference has arrived).
+    private func mixAndWriteCleanedMic(_ clean: [Float]) async {
+        guard !clean.isEmpty else { return }
+        let mixed = mixWithBufferedSystem(mic: clean)
+        if let onLive = onLiveSamples { onLive(mixed[0..<mixed.count]) }
+        await write(mixed)
     }
 
     /// Flush any system audio still buffered when the mic clock stops

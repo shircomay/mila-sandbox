@@ -32,6 +32,7 @@ struct MilaConfig: Codable, Equatable {
     var liveAI: LiveAI?
     var diarization: Toggle?
     var meetingDetection: Toggle?
+    var knowledgeBase: KnowledgeBase? // FORK: spec 05 (type lives in MilaConfig+KnowledgeBase.swift; default nil keeps the memberwise init source-compatible)
 
     /// OpenAI-compatible remote transcription backend (e.g. a self-hosted
     /// `speaches` server running an ivrit.ai model).

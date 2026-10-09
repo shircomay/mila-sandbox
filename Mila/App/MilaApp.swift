@@ -908,12 +908,15 @@ struct MilaApp: App {
         )
         // Applies `.milaconfig` files. Given the settings objects it's allowed
         // to mutate; the open event is routed in from `MilaAppDelegate`.
+        let markdownExport = MarkdownExportSettings() // FORK: spec 01 (created before the importer, which needs it for spec 05)
         let configImporter = MilaConfigImporter(
             remote: remoteSettings,
             language: langSettings,
             liveAI: liveAI,
             diarization: diarSettings,
-            meetingDetection: meetingSettings
+            meetingDetection: meetingSettings,
+            obsidian: obsidianSettings,       // FORK: spec 05
+            markdownExport: markdownExport    // FORK: spec 05
         )
         _store = StateObject(wrappedValue: store)
         _storageSettings = StateObject(wrappedValue: storage)
@@ -941,7 +944,6 @@ struct MilaApp: App {
         _mcpAccessSettings = StateObject(wrappedValue: mcpAccess)
         _claudeSetupSettings = StateObject(wrappedValue: claudeSetup)
         _obsidianExporter = StateObject(wrappedValue: obsidian)
-        let markdownExport = MarkdownExportSettings() // FORK: spec 01
         _markdownExportSettings = StateObject(wrappedValue: markdownExport) // FORK: spec 01
         // Voice Memos (iPhone) folder integration. Settings are opt-in and
         // default-off; the importer wires up its FSEvents watcher + initial

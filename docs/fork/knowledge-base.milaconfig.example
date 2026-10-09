@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "knowledgeBase": {
+    "enabled": true,
+    "folder": "~/path/to/knowledge-base",
+    "subfolder": "Mila transcripts",
+    "noteContent": "transcript",
+    "gitSync": false
+  }
+}

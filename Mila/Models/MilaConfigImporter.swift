@@ -48,13 +48,20 @@ final class MilaConfigImporter: ObservableObject {
     private let liveAI: LiveAISettings
     private let diarization: DiarizationSettings
     private let meetingDetection: MeetingDetectionSettings
+    // FORK: spec 05 — internal (not private) so MilaConfigImporter+KnowledgeBase.swift can use them.
+    let obsidian: ObsidianVaultSettings?
+    let markdownExport: MarkdownExportSettings?
     private let log = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaConfig")
 
     init(remote: RemoteTranscriptionSettings,
          language: RecordingLanguageSettings,
          liveAI: LiveAISettings,
          diarization: DiarizationSettings,
-         meetingDetection: MeetingDetectionSettings) {
+         meetingDetection: MeetingDetectionSettings,
+         obsidian: ObsidianVaultSettings? = nil,             // FORK: spec 05
+         markdownExport: MarkdownExportSettings? = nil) {    // FORK: spec 05
+        self.obsidian = obsidian                             // FORK: spec 05
+        self.markdownExport = markdownExport                 // FORK: spec 05
         self.remote = remote
         self.language = language
         self.liveAI = liveAI
@@ -168,6 +175,7 @@ final class MilaConfigImporter: ObservableObject {
         if let m = config.meetingDetection, let enabled = m.enabled, enabled != meetingDetection.enabled {
             out.append(.init(label: "Meeting detection", value: enabled ? "On" : "Off"))
         }
+        out += knowledgeBaseChanges(for: config) // FORK: spec 05
         return out
     }
 
@@ -200,6 +208,7 @@ final class MilaConfigImporter: ObservableObject {
         if let m = config.meetingDetection, let enabled = m.enabled {
             meetingDetection.enabled = enabled
         }
+        applyKnowledgeBase(config) // FORK: spec 05
         log.log("applied configuration")
     }
 

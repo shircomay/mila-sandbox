@@ -63,8 +63,9 @@ The grouping and rendering would be a small pure type in MilaKit
 
 **Additional context**
 
-I have this implemented and tested, and will open a pull request linked to this
-issue right away. It touches the transcript exporter, `RecordingStore` (remove
+I have this implemented, with unit tests plus a full build and test run passing
+in CI (not yet tried by hand on a real recording), and will open a pull request
+linked to this issue right away. It touches the transcript exporter, `RecordingStore` (remove
 the `.md` along with the `.srt`, and refresh it when a completed recording's
 title changes), `ObsidianExporter`, and adds one settings object. Happy to
 adjust the shape, the defaults or the file format based on your feedback.

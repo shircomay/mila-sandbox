@@ -345,6 +345,7 @@ struct MilaApp: App {
     @StateObject private var hotkeySettings: HotkeySettings
     @StateObject private var languageSettings: RecordingLanguageSettings
     @StateObject private var audioInputSettings: AudioInputSettings
+    @StateObject private var echoCancellationSettings: EchoCancellationSettings  // FORK: meeting echo cancellation (spec 03)
     @StateObject private var inputLevelMonitor: InputLevelMonitor
     @StateObject private var llmSettings: LLMSettings
     @StateObject private var postRecording: PostRecordingCoordinator
@@ -935,6 +936,8 @@ struct MilaApp: App {
         _hotkeySettings = StateObject(wrappedValue: hotkeys)
         _languageSettings = StateObject(wrappedValue: langSettings)
         _audioInputSettings = StateObject(wrappedValue: audioSettings)
+        let echoSettings = EchoCancellationSettings()  // FORK: meeting echo cancellation (spec 03)
+        _echoCancellationSettings = StateObject(wrappedValue: echoSettings)  // FORK
         _inputLevelMonitor = StateObject(wrappedValue: inputMonitor)
         _llmSettings = StateObject(wrappedValue: llm)
         _postRecording = StateObject(wrappedValue: coordinator)
@@ -995,6 +998,7 @@ struct MilaApp: App {
                 .of("hotkeySettings", hotkeys),
                 .of("languageSettings", langSettings),
                 .of("audioInputSettings", audioSettings),
+                .of("echoCancellationSettings", echoSettings),  // FORK
                 .of("inputLevelMonitor", inputMonitor),
                 .of("llmSettings", llm),
                 .of("postRecording", coordinator),
@@ -1041,6 +1045,7 @@ struct MilaApp: App {
                 .environmentObject(hotkeySettings)
                 .environmentObject(languageSettings)
                 .environmentObject(audioInputSettings)
+                .environmentObject(echoCancellationSettings)  // FORK: main window (spec 03)
                 .environmentObject(inputLevelMonitor)
                 .environmentObject(inputLevelMonitor.meter)
                 .environmentObject(llmSettings)
@@ -1146,6 +1151,7 @@ struct MilaApp: App {
                 .environmentObject(hotkeySettings)
                 .environmentObject(transcription)
                 .environmentObject(audioInputSettings)
+                .environmentObject(echoCancellationSettings)  // FORK: Settings scene (spec 03)
                 .environmentObject(inputLevelMonitor)
                 .environmentObject(inputLevelMonitor.meter)
                 .environmentObject(actions)

@@ -428,6 +428,8 @@ private struct AudioSettingsTab: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            EchoCancellationSettingsSection()  // FORK: meeting echo cancellation controls (spec 03)
+
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)

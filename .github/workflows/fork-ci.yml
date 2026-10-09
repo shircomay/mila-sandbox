@@ -1,0 +1,111 @@
+# Fork-only CI for this personal Mila fork (not part of upstream island-io/mila).
+#
+# Upstream's ci.yml only runs on `main` pushes and PRs into `main`. This fork
+# develops on `claude/**`, `personal/**` and `sync/**` branches, so this
+# workflow gives those branches a real macOS build plus the FULL MilaTests
+# suite (upstream CI runs only one test class) and every local Swift package's
+# tests. It is additive (a new file), so upstream merges never conflict on it.
+name: Fork CI
+
+on:
+  push:
+    branches: ['claude/**', 'personal/**', 'sync/**']
+  pull_request:
+    branches: ['claude/**', 'personal/**', 'main']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          sw_vers
+
+      # Every local package that has a Tests/ directory. Picks up fork-added
+      # packages (e.g. Packages/EchoCancellation) without editing this file.
+      - name: Run local Swift package tests
+        run: |
+          set -o pipefail
+          status=0
+          for pkg in Packages/*/; do
+            [ -f "$pkg/Package.swift" ] && [ -d "$pkg/Tests" ] || continue
+            case "$pkg" in Packages/TranscriptionCore/) continue ;; esac  # needs the whisper xcframework; covered by the app build
+            echo "::group::swift test $pkg"
+            (cd "$pkg" && swift test 2>&1 | tee "/tmp/pkg-$(basename "$pkg").log") || { echo "::error::swift test failed in $pkg"; status=1; }
+            echo "::endgroup::"
+          done
+          exit $status
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Cache diarization bundle
+        id: diar-bundle-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: Mila/Resources/PythonRuntime
+          key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
+
+      - name: Build diarization bundle (cold path only)
+        if: steps.diar-bundle-cache.outputs.cache-hit != 'true'
+        run: make bundle-diarization
+
+      - name: Generate Xcode project
+        run: make project
+
+      - name: Resolve Swift Package dependencies
+        run: |
+          xcodebuild -project Mila.xcodeproj -scheme Mila -destination 'platform=macOS' \
+            -resolvePackageDependencies
+
+      - name: Build (Debug)
+        run: |
+          set -o pipefail
+          xcodebuild -project Mila.xcodeproj -scheme Mila -configuration Debug \
+            -derivedDataPath build -destination 'platform=macOS' \
+            build 2>&1 | tee /tmp/build.log | grep -E "error:|warning: unre|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" /tmp/build.log || { grep -E "error:" /tmp/build.log | sort -u | head -100; exit 1; }
+
+      - name: Run MilaTests (full unit suite)
+        run: |
+          set -o pipefail
+          xcodebuild -project Mila.xcodeproj -scheme Mila -configuration Debug \
+            -derivedDataPath build -destination 'platform=macOS' \
+            -only-testing:MilaTests \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 240 \
+            -maximum-test-execution-time-allowance 480 \
+            -resultBundlePath /tmp/MilaTests.xcresult \
+            test > /tmp/test.log 2>&1 || status=$?
+          echo "---- failing test cases ----"
+          grep -E "Test Case .* failed|error: -\[|: error: " /tmp/test.log | sort -u | head -200 || true
+          echo "---- summary ----"
+          grep -E "Executed [0-9]+ tests|\*\* TEST (SUCCEEDED|FAILED)" /tmp/test.log | tail -5 || true
+          exit ${status:-0}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-ci-logs
+          path: |
+            /tmp/build.log
+            /tmp/test.log
+            /tmp/pkg-*.log
+          if-no-files-found: ignore
+          retention-days: 7

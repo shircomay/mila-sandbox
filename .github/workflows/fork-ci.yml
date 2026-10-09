@@ -95,7 +95,9 @@ jobs:
             -resultBundlePath /tmp/MilaTests.xcresult \
             test > /tmp/test.log 2>&1 || status=$?
           echo "---- failing test cases ----"
-          grep -E "Test Case .* failed|error: -\[|: error: " /tmp/test.log | sort -u | head -200 || true
+          grep -E "Test Case .* failed" /tmp/test.log | sort -u || true
+          echo "---- first assertion of each failing test ----"
+          grep -E ": error: " /tmp/test.log | awk 'match($0, /-\[[^]]*\]/) { k = substr($0, RSTART, RLENGTH); if (!seen[k]++) print }' | head -100 || true
           echo "---- summary ----"
           grep -E "Executed [0-9]+ tests|\*\* TEST (SUCCEEDED|FAILED)" /tmp/test.log | tail -5 || true
           exit ${status:-0}

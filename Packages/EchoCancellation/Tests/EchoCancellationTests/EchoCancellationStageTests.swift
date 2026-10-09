@@ -276,6 +276,21 @@ final class EchoCancellationStageTests: XCTestCase {
         XCTAssertEqual(stage.statistics.framesWithReference, 0)
     }
 
+    func test_noReferenceEver_bandLimitedSignalIsNearlyUnchanged() throws {
+        // The spec's check read literally: output ~ input (correlation > 0.99, energy
+        // within 1 dB), for a signal without content under Speex's ~60 Hz high-pass.
+        var mic = SyntheticEcho.multitone(seed: 5, seconds: 8.0)
+        for i in 0..<mic.count { mic[i] += scenario.noise[i] }
+        let stage = try makeStage()
+        let out = StageFeeder.feed(stage: stage, mic: mic, reference: [])
+        XCTAssertEqual(out.count, mic.count)
+        let correlation = Metrics.correlation(out, mic)
+        let energyRatio = Metrics.db(Metrics.energy(out) / Metrics.energy(mic))
+        print("EchoCancellationStage without reference, band-limited input: corr \(correlation), energy \(energyRatio) dB")
+        XCTAssertGreaterThan(correlation, 0.99)         // measured 0.997
+        XCTAssertLessThan(abs(energyRatio), 1.0)         // measured -0.01 dB
+    }
+
     func test_contiguousMode_withoutTimestamps() throws {
         let stage = try makeStage()
         var options = FeedOptions()

@@ -189,6 +189,13 @@ def main() -> None:
     row("stage no reference", "correlation vs DC-notched input", corr(out, exp), "> 0.999")
     row("stage no reference", "energy vs input (dB)", tune.db(tune.energy(out) / tune.energy(nm24)), "abs(x) < 1")
 
+    tones = synth.multitone(5, 8.0)
+    tmic = tones + noise[:len(tones)]
+    st = ss.make_stage(cfg)
+    out = ss.feed(st, tmic, np.zeros(0, dtype=np.float32))
+    row("stage no reference (multitone)", "correlation vs raw input", corr(out, tmic), "> 0.99")
+    row("stage no reference (multitone)", "energy vs input (dB)", tune.db(tune.energy(out) / tune.energy(tmic)), "abs(x) < 1")
+
     # absurd basis
     st = ss.make_stage(cfg)
     n10 = 10 * SR

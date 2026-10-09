@@ -51,6 +51,17 @@ final class SyntheticEchoParityTests: XCTestCase {
         XCTAssertEqual(Double(h[0]), 0)
     }
 
+    func test_multitone_matchesPython() {
+        // synth.multitone(5, 8.0)
+        let x = SyntheticEcho.multitone(seed: 5, seconds: 8.0)
+        XCTAssertEqual(x.count, 128_000)
+        XCTAssertEqual(Double(x[0]), 0.0006821512943133712, accuracy: 1e-5)
+        XCTAssertEqual(Double(x[1]), -0.04033581167459488, accuracy: 1e-5)
+        XCTAssertEqual(Double(x[2]), -0.05027799308300018, accuracy: 1e-5)
+        XCTAssertEqual(Double(x[7000]), 0.01979917474091053, accuracy: 1e-5)
+        XCTAssertEqual(Metrics.energy(x), 404.7715405362509, accuracy: 404.77 * 1e-4)
+    }
+
     func test_convolveAndDcNotch_matchPython() {
         let speech = SyntheticEcho.speechLike(seed: 1, seconds: 2.0, targetRMSdBFS: -15.0)
         let x = Array(speech[0..<8000])

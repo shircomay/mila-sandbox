@@ -217,6 +217,37 @@ enum SyntheticEcho {
         return h.map { Float($0) }
     }
 
+    /// Stationary band-limited test signal (no energy below `loHz`): a sum of
+    /// sinusoids with random frequency, amplitude and phase. Unlike speech it has no
+    /// content in the ~60 Hz high-pass of Speex's echo canceller, so "the canceller
+    /// leaves it alone" can be checked against the raw input.
+    static func multitone(seed: UInt64, seconds: Double, tones: Int = 24, loHz: Double = 600.0,
+                          hiHz: Double = 3400.0, rmsDbfs: Double = -25.0) -> [Float] {
+        let sr = Double(sampleRate)
+        var rng = SplitMix64(seed: seed)
+        let n = Int((seconds * sr).rounded())
+        var params: [(f: Double, a: Double, p: Double)] = []
+        for _ in 0..<tones {
+            let f = rng.uniform(loHz, hiHz)
+            let a = rng.uniform(0.2, 1.0)
+            let p = rng.uniform(0.0, 2.0 * Double.pi)
+            params.append((f, a, p))
+        }
+        var x = [Double](repeating: 0, count: n)
+        for tone in params {
+            var i = 0
+            while i < n {
+                x[i] += tone.a * sin(2.0 * Double.pi * tone.f * Double(i) / sr + tone.p)
+                i += 1
+            }
+        }
+        var sum = 0.0
+        for v in x { sum += v * v }
+        let rms = (sum / Double(n)).squareRoot()
+        let gain = pow(10.0, rmsDbfs / 20.0) / rms
+        return x.map { Float($0 * gain) }
+    }
+
     /// Soft clip with unity small-signal gain: tanh(drive*x)/drive.
     static func speakerNonlinearity(_ x: [Float], drive: Double = 3.0) -> [Float] {
         return x.map { Float(tanh(drive * Double($0)) / drive) }

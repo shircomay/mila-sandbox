@@ -196,6 +196,29 @@ def dbfs(x: np.ndarray) -> float:
     return 10.0 * math.log10(max(e, 1e-20))
 
 
+def multitone(seed: int, seconds: float, sr: int = 16000, tones: int = 24, lo_hz: float = 600.0,
+              hi_hz: float = 3400.0, rms_dbfs: float = -25.0) -> np.ndarray:
+    """Stationary band-limited test signal (no energy below `lo_hz`): a sum of
+    sinusoids with random frequency, amplitude and phase. Unlike speech it has no
+    content in the ~60 Hz high-pass of Speex's echo canceller, so "the canceller
+    leaves it alone" can be checked against the raw input."""
+    rng = SplitMix64(seed)
+    n = int(round(seconds * sr))
+    params = []
+    for _ in range(tones):
+        f = rng.uniform_in(lo_hz, hi_hz)
+        a = rng.uniform_in(0.2, 1.0)
+        p = rng.uniform_in(0.0, 2.0 * math.pi)
+        params.append((f, a, p))
+    idx = np.arange(n, dtype=np.float64)
+    x = np.zeros(n, dtype=np.float64)
+    for f, a, p in params:
+        x += a * np.sin(2.0 * math.pi * f * idx / sr + p)
+    rms = math.sqrt(float(np.mean(x ** 2)))
+    x *= (10.0 ** (rms_dbfs / 20.0)) / rms
+    return x.astype(np.float32)
+
+
 def dc_notch(x: np.ndarray, radius: float = 0.982) -> np.ndarray:
     """Replica of the DC-notch high-pass at the input of Speex's echo canceller
     (filter_dc_notch16 in mdf.c, float build, radius 0.982 at 16 kHz). The

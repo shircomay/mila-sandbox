@@ -237,7 +237,7 @@ length conserved: True; reference re-anchors 12; heldTooLong 1062
 | framesWithReference / framesProcessed | 0 / 2001 |
 | framesHeldTooLong | 2000 |
 | ERLE 12-20 s | 0.2 |
-| wall time (s) | 0.20 |
+| wall time (s) | 0.19 |
 
 #### Random chunk sizes (conservation + ordering)
 
@@ -251,7 +251,7 @@ length conserved: True; reference re-anchors 12; heldTooLong 1062
 
 #### Throughput
 
-60 s of audio through the stage model (Python overhead included): 0.68 s
+60 s of audio through the stage model (Python overhead included): 0.69 s
 
 Throughput (this container, `cc -O2`, Speex only): 30 s of audio take about 0.3 s with the
 residual suppressor and 0.2 s without (≈100–150x real time, about 1 % of a core). At `-O0`
@@ -310,6 +310,8 @@ prints the measured value next to the threshold each test asserts:
 | stage no reference | length conserved | True | true |
 | stage no reference | correlation vs DC-notched input | 1.000 | > 0.999 |
 | stage no reference | energy vs input (dB) | -0.463 | abs(x) < 1 |
+| stage no reference (multitone) | correlation vs raw input | 0.997 | > 0.99 |
+| stage no reference (multitone) | energy vs input (dB) | -0.008 | abs(x) < 1 |
 | stage absurd basis | length conserved | True | true |
 | stage absurd basis | offset stat (ms) | 999995000.000 | ~ 1e9 |
 | stage absurd basis | framesWithReference | 0 | == 0 |
@@ -317,7 +319,7 @@ prints the measured value next to the threshold each test asserts:
 | stage pause/resume | length conserved | True | true |
 | stage pause/resume | ERLE 14-24 s (filter kept) | 21.370 | >= 12 |
 | stage pause/resume | ERLE 12-14 s after resetFilter:true | 4.958 | < 12 |
-| stage throughput (python model) | wall time for 60 s (s) | 0.663 | n/a (Swift: < 5) |
+| stage throughput (python model) | wall time for 60 s (s) | 0.689 | n/a (Swift: < 5) |
 
 ## WebRTC AEC3 comparison (optional)
 

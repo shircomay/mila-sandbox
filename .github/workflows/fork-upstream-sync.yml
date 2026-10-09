@@ -1,0 +1,121 @@
+# Fork-only: weekly upstream sync for this personal Mila fork (not part of
+# upstream island-io/mila). Merges the newest upstream release into the default
+# branch with "prefer mine" semantics (scripts/fork/sync-upstream.sh --ci), pushes
+# the bot-owned branch sync/upstream-<target> and opens ONE pull request for it.
+# If upstream and the fork changed the same file structurally (modify/delete,
+# rename, binary) it opens ONE issue instead. See FORK.md.
+#
+# Why the optional FORK_SYNC_TOKEN secret exists:
+#   1. The built-in GITHUB_TOKEN cannot push commits that modify
+#      .github/workflows/* (upstream does this often), so such a push is rejected.
+#   2. Pull requests opened with GITHUB_TOKEN do not trigger other workflows, so
+#      "Fork CI" would never build the sync PR.
+# A fine-grained personal access token for THIS repository only, with
+# Contents, Pull requests, Issues and Workflows read/write, fixes both. Without
+# it the workflow still works for syncs that do not touch workflow files; start
+# Fork CI by hand (workflow_dispatch) on the sync branch in that case.
+name: Fork upstream sync
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Upstream target: latest, main or a tag like v1.9.7'
+        default: 'latest'
+        required: false
+      base_branch:
+        description: 'Branch to merge into (empty = repository default branch)'
+        default: ''
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+      INPUT_TARGET: ${{ inputs.target }}
+      INPUT_BASE: ${{ inputs.base_branch }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Resolve inputs
+        id: inputs
+        run: |
+          target="${INPUT_TARGET:-latest}"
+          base="${INPUT_BASE:-$DEFAULT_BRANCH}"
+          if ! [[ "$target" =~ ^(latest|main|v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
+            echo "::error::Invalid target '$target'"; exit 1
+          fi
+          if ! [[ "$base" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Invalid base branch '$base'"; exit 1
+          fi
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.inputs.outputs.base }}
+          fetch-depth: 0
+          token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+
+      - name: Configure git identity and upstream remote
+        run: |
+          git config user.name "fork-sync[bot]"
+          git config user.email "fork-sync-bot@users.noreply.github.com"
+          git remote add upstream https://github.com/island-io/mila.git
+
+      - name: Merge upstream (prefer the fork)
+        id: sync
+        env:
+          SYNC_REPORT: ${{ runner.temp }}/sync-report.md
+          TARGET: ${{ steps.inputs.outputs.target }}
+          BASE: ${{ steps.inputs.outputs.base }}
+        run: |
+          rc=0
+          bash scripts/fork/sync-upstream.sh --ci --target "$TARGET" --base "$BASE" || rc=$?
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          # Exit 2 (structural conflict) is handled by the issue step below.
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then exit "$rc"; fi
+
+      - name: Push branch and open or update the pull request
+        if: steps.sync.outputs.exit_code == '0' && steps.sync.outputs.SYNC_RESULT == 'merged'
+        env:
+          SYNC_TARGET: ${{ steps.sync.outputs.SYNC_TARGET }}
+          SYNC_BRANCH: ${{ steps.sync.outputs.SYNC_BRANCH }}
+          BASE: ${{ steps.inputs.outputs.base }}
+          REPORT: ${{ runner.temp }}/sync-report.md
+        run: |
+          git fetch origin "$SYNC_BRANCH" || true   # sets the lease; bot-owned branch
+          git push --force-with-lease origin "$SYNC_BRANCH"
+          title="Upstream sync: $SYNC_TARGET"
+          existing=$(gh pr list --head "$SYNC_BRANCH" --base "$BASE" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --title "$title" --body-file "$REPORT"
+          else
+            gh pr create --head "$SYNC_BRANCH" --base "$BASE" --title "$title" --body-file "$REPORT"
+          fi
+
+      - name: Open or update the manual-merge issue
+        if: steps.sync.outputs.exit_code == '2'
+        env:
+          SYNC_TARGET: ${{ steps.sync.outputs.SYNC_TARGET }}
+          REPORT: ${{ runner.temp }}/sync-report.md
+        run: |
+          title="Upstream sync needs a manual merge: $SYNC_TARGET"
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number,title --jq "[.[] | select(.title == \"$title\")][0].number // empty")
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --body-file "$REPORT"
+          else
+            gh issue create --title "$title" --body-file "$REPORT"
+          fi

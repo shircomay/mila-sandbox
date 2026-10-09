@@ -16,6 +16,7 @@ Personal Mila = upstream Mila plus these features (specs in
 | Echo-cancellation core (`Packages/EchoCancellation`) | [02](docs/fork/designs/02-aec-core.md) |
 | Echo cancellation wired into recording | [03](docs/fork/designs/03-aec-integration.md) |
 | Upstream sync, personal-build guard, DMG workflow (this file) | [04](docs/fork/designs/04-fork-maintenance.md) |
+| Knowledge-base folder via `.milaconfig`, title refresh | [05](docs/fork/designs/05-kb-folder-and-title-refresh.md) |
 
 Fork code is additive (new files) with small upstream-file hooks marked
 `FORK:`; `git grep -n "FORK:"` lists every one. The personal build:
@@ -105,6 +106,55 @@ without the owner's explicit OK. In outline:
 
 Beta and "nightly" are update channels for users, not a way to contribute.
 
+## 6. Knowledge-base folder
+
+Goal: every finished transcript lands, as Markdown, in your knowledge-base (KB)
+folder, without that path ever appearing in this public repository.
+
+**How it works.** It reuses Mila's Obsidian-vault exporter (one
+`<date> <title>.md` per recording, idempotent) and the note-content choice from
+the Markdown feature. A private helper on your Mac writes a `.milaconfig` file
+with a `knowledgeBase` section; you double-click it, Mila shows its usual
+confirmation sheet listing only what would change, and applying it sets the
+folder, subfolder, note content, git sync and the on/off switch (in that order,
+"on" last). The format is in
+[`docs/fork/knowledge-base.milaconfig.example`](docs/fork/knowledge-base.milaconfig.example):
+
+```json
+{
+  "version": 1,
+  "knowledgeBase": {
+    "enabled": true,
+    "folder": "~/path/to/knowledge-base",
+    "subfolder": "Mila transcripts",
+    "noteContent": "transcript",
+    "gitSync": false
+  }
+}
+```
+
+- Every field is optional; absent leaves the current setting alone.
+- `noteContent` is `summaryElseTranscript`, `transcript` or
+  `summaryAndTranscript`; an unknown value is ignored.
+- `folder` must be absolute after `~` expansion; a relative path is refused with a
+  message. A missing folder is created (its parent must exist).
+- Official Mila builds ignore the extra key, so `version` stays 1.
+
+**The real file lives only on your Mac.** Keep the actual `.milaconfig` (with your
+real path) out of the repository and out of any shared drive; only the placeholder
+example above is committed. Settings → Storage shows the result like any other
+Obsidian-vault setup, so you can also set it by hand.
+
+**Commit & push.** Leave `gitSync` off (the default) unless the KB folder is a
+private repository. With it on, Mila commits and pushes that folder after every
+note.
+
+**Title refresh.** When a completed recording's title changes (the post-recording
+naming sheet, an automatic LLM title, or a rename), the `.md` sidecar is rewritten
+and the KB note is renamed in place (the exporter's index keeps one note per
+recording, so no duplicate appears). A note still waiting for its summary is left
+to the summary step, which writes it with the newest title.
+
 ## Upstream files touched
 
 One row per upstream file with fork hooks (other specs append rows).
@@ -124,3 +174,7 @@ One row per upstream file with fork hooks (other specs append rows).
 | `Mila/Views/RecordingContextMenu.swift` | "Export Transcript (.md)…" button after "Export Subtitles (.srt)…" | 01 |
 | `Mila/Views/RecordingDetailView.swift` | Export-transcript toolbar button after the `.srt` button | 01 |
 | `Mila/Views/StorageSettingsTab.swift` | `MarkdownExportSettingsSection()` one line after `ObsidianSettingsSection()` | 01 |
+| `Mila/Models/MilaConfig.swift` | `var knowledgeBase: KnowledgeBase?` (default nil keeps existing memberwise calls compiling); the type is in `MilaConfig+KnowledgeBase.swift` | 05 |
+| `Mila/Models/MilaConfigImporter.swift` | internal `obsidian`/`markdownExport` properties; `init` gains two defaulted trailing parameters; `plannedChanges` calls `knowledgeBaseChanges(for:)`; `apply` calls `applyKnowledgeBase(_:)` | 05 |
+| `Mila/Models/RecordingStore.swift` | `onCompletedRecordingRetitled` callback; `update(_:)` rewrites the `.md` sidecar and fires it when a completed recording's title changed; `rename(_:to:)` fires it after the sidecar rewrite | 05 |
+| `Mila/App/MilaApp.swift` | `MarkdownExportSettings` created before the importer (moved up from its later line); importer receives `obsidian:`/`markdownExport:`; `store.onCompletedRecordingRetitled` re-exports the KB note unless it is still pending | 05 |

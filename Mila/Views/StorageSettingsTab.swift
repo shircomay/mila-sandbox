@@ -58,6 +58,7 @@ struct StorageSettingsTab: View {
                 // done here (this is a container change only) — it's a
                 // separate, reviewable UX call.
                 ObsidianSettingsSection()
+                MarkdownExportSettingsSection() // FORK: spec 01
                 // Same reasoning as Obsidian above: an opt-in destination for
                 // transcripts, one toggle wide until enabled, parked here
                 // instead of a tab of its own.

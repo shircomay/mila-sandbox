@@ -117,3 +117,10 @@ One row per upstream file with fork hooks (other specs append rows).
 | `Mila/App/MilaApp.swift` | "Check for Updates…" stays enabled in the personal build (updater not started) | 04 |
 | `project.yml` | `MilaForkPersonalBuild: true` Info.plist key | 04 |
 | `.github/dependabot.yml` | `open-pull-requests-limit: 0` on both ecosystems | 04 |
+| `Mila/Transcription/TranscriptExporter.swift` | `writeSRT(for:in:)`: one `defer { MarkdownTranscriptExporter.writeSidecar(...) }` line writes the `.md` sidecar after the `.srt` (no-op unless enabled; `defer` covers the early return) | 01 |
+| `Mila/Models/RecordingStore.swift` | `permanentlyDelete` and `emptyTrash`: also `removeSidecar` next to the `.srt` removal; `rename`: rewrite the `.md` sidecar (title/heading) for completed recordings | 01 |
+| `Mila/Actions/ObsidianExporter.swift` | `markdown(for:)` gains defaulted `content:`/`timestamps:` (non-default modes build the note via `MarkdownTranscriptExporter.vaultNote`); `hasContent` gains defaulted `content:` (segments count in transcript modes); `writeNote` reads `MarkdownExportSettings.current(defaults)` and passes both | 01 |
+| `Mila/App/MilaApp.swift` | `@StateObject markdownExportSettings`, created in `init`, registered with the churn probe, `.environmentObject` on the main window and the Settings scene | 01 |
+| `Mila/Views/RecordingContextMenu.swift` | "Export Transcript (.md)…" button after "Export Subtitles (.srt)…" | 01 |
+| `Mila/Views/RecordingDetailView.swift` | Export-transcript toolbar button after the `.srt` button | 01 |
+| `Mila/Views/StorageSettingsTab.swift` | `MarkdownExportSettingsSection()` one line after `ObsidianSettingsSection()` | 01 |

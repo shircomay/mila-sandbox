@@ -154,6 +154,8 @@ private struct RecordingContextMenu: ViewModifier {
                 exportSRT()
             }
             .disabled(recording.segments.isEmpty)
+            Button("Export Transcript (.md)…") { MarkdownTranscriptExportPanel.present(for: recording) } // FORK: spec 01
+                .disabled(recording.segments.isEmpty && recording.fullText.isEmpty) // FORK: spec 01
             Button("Reveal in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting([store.audioURL(for: recording)])
             }

@@ -373,6 +373,7 @@ struct MilaApp: App {
     /// installed; a second instance would mean two views of one install.
     @StateObject private var claudeSetupSettings: ClaudeSetupSettings
     @StateObject private var obsidianExporter: ObsidianExporter
+    @StateObject private var markdownExportSettings: MarkdownExportSettings // FORK: spec 01
     @StateObject private var voiceMemosSettings: VoiceMemosSettings
     @StateObject private var voiceMemosImporter: VoiceMemosImporter
     /// Persistent, app-wide list of speaker names — the pick-list behind
@@ -940,6 +941,8 @@ struct MilaApp: App {
         _mcpAccessSettings = StateObject(wrappedValue: mcpAccess)
         _claudeSetupSettings = StateObject(wrappedValue: claudeSetup)
         _obsidianExporter = StateObject(wrappedValue: obsidian)
+        let markdownExport = MarkdownExportSettings() // FORK: spec 01
+        _markdownExportSettings = StateObject(wrappedValue: markdownExport) // FORK: spec 01
         // Voice Memos (iPhone) folder integration. Settings are opt-in and
         // default-off; the importer wires up its FSEvents watcher + initial
         // backfill from its `start()` launch task (below), so constructing
@@ -999,6 +1002,7 @@ struct MilaApp: App {
                 .of("mcpAccessSettings", mcpAccess),
                 .of("claudeSetupSettings", claudeSetup),
                 .of("obsidianExporter", obsidian),
+                .of("markdownExportSettings", markdownExport), // FORK: spec 01
                 .of("voiceMemosSettings", vmSettings),
                 .of("voiceMemosImporter", vmImporter),
                 .of("configImporter", configImporter),
@@ -1089,6 +1093,7 @@ struct MilaApp: App {
                 .environmentObject(mcpAccessSettings)
                 .environmentObject(claudeSetupSettings)
                 .environmentObject(obsidianExporter)
+                .environmentObject(markdownExportSettings) // FORK: spec 01
         }
         .commands {
             CommandGroup(after: .appInfo) {
@@ -1156,6 +1161,7 @@ struct MilaApp: App {
                 .environmentObject(mcpAccessSettings)
                 .environmentObject(claudeSetupSettings)
                 .environmentObject(obsidianExporter)
+                .environmentObject(markdownExportSettings) // FORK: spec 01
         }
         // Settings used to be pinned to 700×560 by a rigid `.frame` inside
         // `SettingsView`; since #177 it is a resizable sidebar window whose

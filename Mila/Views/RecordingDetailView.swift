@@ -229,6 +229,15 @@ struct RecordingDetailView: View {
             }
             .disabled(recording.segments.isEmpty)
             .help("Export subtitles (.srt) for the original video/audio")
+
+            // FORK: spec 01 — Markdown transcript export next to the .srt button.
+            Button {
+                MarkdownTranscriptExportPanel.present(for: recording)
+            } label: {
+                Image(systemName: "doc.plaintext")
+            }
+            .disabled(recording.segments.isEmpty && recording.fullText.isEmpty)
+            .help("Export transcript (.md)")
         }
     }
 

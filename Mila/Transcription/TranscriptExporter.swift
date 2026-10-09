@@ -12,6 +12,8 @@ enum TranscriptExporter {
     /// transcription so every completed recording has a ready-to-share
     /// .srt file alongside its .wav.
     static func writeSRT(for recording: Recording, in directory: URL) {
+        // FORK: also write the paragraph .md sidecar (no-op unless enabled); `defer` covers every return below.
+        defer { MarkdownTranscriptExporter.writeSidecar(for: recording, in: directory) }
         let srtName = (recording.audioFileName as NSString).deletingPathExtension + ".srt"
         let url = directory.appendingPathComponent(srtName)
         let body = srtBody(for: recording)

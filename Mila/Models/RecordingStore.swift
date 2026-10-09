@@ -626,6 +626,10 @@ final class RecordingStore: ObservableObject {
         guard recordings[idx].title != trimmed else { return }
         recordings[idx].title = trimmed
         persist()
+        // FORK: keep the .md sidecar's title/heading in step (no-op unless enabled).
+        if recordings[idx].status == .completed {
+            MarkdownTranscriptExporter.writeSidecar(for: recordings[idx], in: recordingsDirectory)
+        }
     }
 
     /// Assign (or clear, with nil/empty) a display name for one raw
@@ -1013,6 +1017,7 @@ final class RecordingStore: ObservableObject {
         try? fileManager.removeItem(at: transcriptURL(for: recording))
         try? fileManager.removeItem(at: summaryURL(for: recording))
         try? fileManager.removeItem(at: subtitleURL(for: recording))
+        MarkdownTranscriptExporter.removeSidecar(for: recording, in: recordingsDirectory, fileManager: fileManager) // FORK: .md sidecar
         // Tombstone a deleted Voice-Memos import so the next sync doesn't
         // resurrect it: the importer's dedup is keyed on the LIVE store, and
         // the source memo still exists in the Voice Memos folder — deleting
@@ -1052,6 +1057,7 @@ final class RecordingStore: ObservableObject {
             try? fileManager.removeItem(at: transcriptURL(for: recording))
             try? fileManager.removeItem(at: summaryURL(for: recording))
             try? fileManager.removeItem(at: subtitleURL(for: recording))
+            MarkdownTranscriptExporter.removeSidecar(for: recording, in: recordingsDirectory, fileManager: fileManager) // FORK: .md sidecar
             if let memoID = recording.voiceMemoUniqueID {
                 voiceMemoTombstones.insert(memoID)
                 tombstonedAny = true

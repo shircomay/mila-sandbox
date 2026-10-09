@@ -226,7 +226,9 @@ final class ObsidianExporter: ObservableObject {
         // user deletes), and "I deleted it and it still turned up in my vault"
         // is the worst possible surprise from a background exporter.
         guard !recording.isTrashed else { return nil }
-        guard Self.hasContent(recording), let destDir = destinationDirectory(for: recording) else {
+        let markdownSettings = MarkdownExportSettings.current(defaults) // FORK: note content mode
+        guard Self.hasContent(recording, content: markdownSettings.noteContent), // FORK: content mode
+              let destDir = destinationDirectory(for: recording) else {
             return nil
         }
         // Defence in depth, immediately before the first thing that touches
@@ -291,7 +293,10 @@ final class ObsidianExporter: ObservableObject {
         }
 
         do {
-            try Self.markdown(for: recording).write(to: target, atomically: true, encoding: .utf8)
+            try Self.markdown(for: recording,
+                              content: markdownSettings.noteContent,                 // FORK: content mode
+                              timestamps: markdownSettings.paragraphTimestamps)      // FORK: content mode
+                .write(to: target, atomically: true, encoding: .utf8)
         } catch {
             let ns = error as NSError
             obsidianLog.error("""
@@ -482,7 +487,13 @@ final class ObsidianExporter: ObservableObject {
 
     /// True when the recording has anything worth writing (a summary,
     /// transcript text, or action items).
-    static func hasContent(_ recording: Recording) -> Bool {
+    static func hasContent(_ recording: Recording,
+                           content: MarkdownExportSettings.NoteContent = .summaryElseTranscript) -> Bool { // FORK: content mode
+        // FORK: in the transcript modes, segment text alone (empty fullText sidecar) is content.
+        if content != .summaryElseTranscript,
+           recording.segments.contains(where: { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+            return true
+        }
         if !(recording.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return true
         }
@@ -505,7 +516,14 @@ final class ObsidianExporter: ObservableObject {
 
     /// Build the note body: `# title`, then the summary (or a `## Transcript`
     /// fallback), then a `## Action items` checklist when present.
-    static func markdown(for recording: Recording) -> String {
+    static func markdown(for recording: Recording,
+                         content: MarkdownExportSettings.NoteContent = .summaryElseTranscript, // FORK: content mode
+                         timestamps: Bool = true) -> String {                                  // FORK: content mode
+        // FORK: transcript modes build the note from the paragraph exporter; an empty result (no transcript) falls through to the upstream path.
+        if content != .summaryElseTranscript {
+            let note = MarkdownTranscriptExporter.vaultNote(for: recording, content: content, timestamps: timestamps)
+            if !note.isEmpty { return note }
+        }
         let title = singleLine(recording.title)
         var out = "# \(title.isEmpty ? "Untitled recording" : title)\n"
 

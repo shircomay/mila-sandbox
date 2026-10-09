@@ -1,0 +1,26 @@
+From f81186ff9122029670581f72d31928cefc21af91 Mon Sep 17 00:00:00 2001
+From: shircomay <112399495+shircomay@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 23:22:39 +0000
+Subject: [PATCH 4/4] docs(readme): note echo cancellation in the changelog
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D6Ni8F4iG4iXK8xfgdhSqe
+---
+ README.md | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/README.md b/README.md
+index 84eb396..547cbed 100644
+--- a/README.md
++++ b/README.md
+@@ -222,6 +222,7 @@ distribution via the App Store you'd:
+ 
+ Newest first. Dates are release dates.
+ 
++- **Unreleased** — Echo cancellation for meeting recordings: an opt-in setting (Settings → Audio, off by default) that removes the echo your microphone picks up from the speakers, using the app audio Mila already captures as the reference, plus optional debug audio for tuning.
+ - **1.9.0** (2026-07-22) — Remote transcription server support (OpenAI-compatible API), one-click `.milaconfig` setup files, iPhone Voice Memos sync, named speaker labels, opt-in beta updates, hallucination reduction via neural VAD, adaptive gain for quiet mics, auto-discard of empty clips, stop/remove queue items, no more stuck "Queued" items after relaunch, color-coded speakers, mid-recording SRT export, automatic summaries toggle with configurable timeout, record button no longer waits on the previous summary, collapsible "All Transcriptions" sidebar section, CodeQL security scanning added to CI, and a large sweep of reliability fixes across audio capture, diarization, and UI.
+ - **1.8.5** (2026-06-09) — Independent mic / app-audio capture toggles, AAC (`.m4a`) recordings, and a configurable recording-storage cap.
+ - **1.8.4** (2026-06-09) — Fixed speaker diarization silently breaking in notarized builds (the bundled Python couldn't load torch's dylibs).
+-- 
+2.43.0
+

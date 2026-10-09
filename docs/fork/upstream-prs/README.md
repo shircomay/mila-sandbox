@@ -15,6 +15,7 @@ and packaged as its own pull request into `island-io/mila:main`:
 | Package | Feature |
 | --- | --- |
 | `01-markdown-transcripts` | Speaker-paragraph Markdown transcripts: opt-in `.md` sidecar, vault note content choice, Export Transcript (.md)… |
+| `02-echo-cancellation` | Opt-in acoustic echo cancellation for meeting recordings: timestamped capture, `EchoCancellation` package with vendored SpeexDSP, Settings > Audio section. Independent of package 01. |
 
 The patches carry no fork-only code (no `ForkBuild`, no personal defaults, no
 `FORK:` markers). They are not applied to this fork's branches; this fork has

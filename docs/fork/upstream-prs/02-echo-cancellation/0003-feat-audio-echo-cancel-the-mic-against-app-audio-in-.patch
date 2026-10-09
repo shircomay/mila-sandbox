@@ -1,0 +1,1987 @@
+From 7d39d0b346d17feced973d5258a3791767a670e1 Mon Sep 17 00:00:00 2001
+From: shircomay <112399495+shircomay@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 23:22:36 +0000
+Subject: [PATCH 3/4] feat(audio): echo-cancel the mic against app audio in
+ meeting recordings
+
+With speakers instead of headphones, the microphone records the remote
+voices a second time, delayed and reverberant, on top of the clean copy that
+ScreenCaptureKit delivers. This runs the microphone through
+EchoCancellationStage, with the app audio as the reference, before the two
+are mixed, so the app audio stays in the recording once.
+
+Opt-in: off by default (`echoCancellation.enabled`), meeting recordings
+only, applied from the next recording. With it off, or for microphone-only
+and app-audio-only recordings, no stage is created, the timestamp queues stay
+disabled and the recording path is the one that was there before.
+
+RecordingSession
+- Pops the capture timestamp for every buffer, including ones dropped while
+  paused, so the queues never drift against the streams.
+- Feeds the app audio to the stage as the reference and mixes the stage's
+  output instead of the raw microphone. The stage holds a frame up to 150 ms
+  for its reference, so output can lag the input; it never adds or drops a
+  microphone sample.
+- Applies the adaptive gain to the cleaned samples (deferred gain, see the
+  previous commit).
+- Flushes held microphone audio on pause and stop, and restarts the stage's
+  timeline on pause. stop() now also closes the WAV explicitly so the file is
+  complete on disk when it returns.
+- Once per recording, when both streams have produced a timestamp, checks that
+  the two clocks agree. ScreenCaptureKit is assumed to stamp on the host time
+  clock like AVAudioTime; if the two streams' timestamps are more than 5 s
+  apart that assumption is wrong, the stage falls back to arrival order
+  (contiguous mode) and the summary says so.
+- A stage that cannot be created bypasses to the existing behaviour.
+- Test seams: `consumeSystem` is internal like `consumeMic`,
+  `startFakeMeetingForTesting` and `installEchoStageForTesting`.
+
+Settings > Audio gets a "Remove speaker echo from meeting recordings"
+toggle, an optional "Save echo-cancellation debug audio" toggle (three
+parallel WAVs per meeting, raw mic / aligned reference / cleaned mic, in an
+`aec-debug` folder next to the recording; off by default) and a one-line
+"Last meeting" summary (echo reduction, estimated delay, reference presence,
+or why it was bypassed; numbers only, no user content). EchoCancellationSettings
+is an app-wide @StateObject injected into both scenes and registered with the
+churn probe; it publishes nothing at audio cadence.
+
+Tests: RecordingSessionEchoCancellationTests (synthetic echo through a fake
+meeting session: cancellation vs. the same run without a stage, late and
+silent references, no audio lost across pause/resume/stop, clock-mismatch
+fallback, deferred gain, debug audio, and that a session without a stage is
+untouched) and EchoCancellationSettingsTests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D6Ni8F4iG4iXK8xfgdhSqe
+---
+ Mila/App/MilaApp.swift                        |   6 +
+ Mila/Audio/AECDebugAudioWriter.swift          | 137 +++
+ .../RecordingSession+EchoCancellation.swift   | 289 ++++++
+ Mila/Audio/RecordingSession.swift             |  78 +-
+ Mila/Models/EchoCancellationSettings.swift    | 147 +++
+ .../EchoCancellationSettingsSection.swift     |  51 ++
+ Mila/Views/SettingsView.swift                 |   2 +
+ MilaTests/EchoCancellationSettingsTests.swift | 174 ++++
+ ...ecordingSessionEchoCancellationTests.swift | 846 ++++++++++++++++++
+ 9 files changed, 1729 insertions(+), 1 deletion(-)
+ create mode 100644 Mila/Audio/AECDebugAudioWriter.swift
+ create mode 100644 Mila/Audio/RecordingSession+EchoCancellation.swift
+ create mode 100644 Mila/Models/EchoCancellationSettings.swift
+ create mode 100644 Mila/Views/EchoCancellationSettingsSection.swift
+ create mode 100644 MilaTests/EchoCancellationSettingsTests.swift
+ create mode 100644 MilaTests/RecordingSessionEchoCancellationTests.swift
+
+diff --git a/Mila/App/MilaApp.swift b/Mila/App/MilaApp.swift
+index 2d2c107..f1ce1d8 100644
+--- a/Mila/App/MilaApp.swift
++++ b/Mila/App/MilaApp.swift
+@@ -337,6 +337,7 @@ struct MilaApp: App {
+     @StateObject private var hotkeySettings: HotkeySettings
+     @StateObject private var languageSettings: RecordingLanguageSettings
+     @StateObject private var audioInputSettings: AudioInputSettings
++    @StateObject private var echoCancellationSettings: EchoCancellationSettings
+     @StateObject private var inputLevelMonitor: InputLevelMonitor
+     @StateObject private var llmSettings: LLMSettings
+     @StateObject private var postRecording: PostRecordingCoordinator
+@@ -916,6 +917,8 @@ struct MilaApp: App {
+         _hotkeySettings = StateObject(wrappedValue: hotkeys)
+         _languageSettings = StateObject(wrappedValue: langSettings)
+         _audioInputSettings = StateObject(wrappedValue: audioSettings)
++        let echoSettings = EchoCancellationSettings()
++        _echoCancellationSettings = StateObject(wrappedValue: echoSettings)
+         _inputLevelMonitor = StateObject(wrappedValue: inputMonitor)
+         _llmSettings = StateObject(wrappedValue: llm)
+         _postRecording = StateObject(wrappedValue: coordinator)
+@@ -975,6 +978,7 @@ struct MilaApp: App {
+                 .of("hotkeySettings", hotkeys),
+                 .of("languageSettings", langSettings),
+                 .of("audioInputSettings", audioSettings),
++                .of("echoCancellationSettings", echoSettings),
+                 .of("inputLevelMonitor", inputMonitor),
+                 .of("llmSettings", llm),
+                 .of("postRecording", coordinator),
+@@ -1020,6 +1024,7 @@ struct MilaApp: App {
+                 .environmentObject(hotkeySettings)
+                 .environmentObject(languageSettings)
+                 .environmentObject(audioInputSettings)
++                .environmentObject(echoCancellationSettings)
+                 .environmentObject(inputLevelMonitor)
+                 .environmentObject(inputLevelMonitor.meter)
+                 .environmentObject(llmSettings)
+@@ -1124,6 +1129,7 @@ struct MilaApp: App {
+                 .environmentObject(hotkeySettings)
+                 .environmentObject(transcription)
+                 .environmentObject(audioInputSettings)
++                .environmentObject(echoCancellationSettings)
+                 .environmentObject(inputLevelMonitor)
+                 .environmentObject(inputLevelMonitor.meter)
+                 .environmentObject(actions)
+diff --git a/Mila/Audio/AECDebugAudioWriter.swift b/Mila/Audio/AECDebugAudioWriter.swift
+new file mode 100644
+index 0000000..14a5dc9
+--- /dev/null
++++ b/Mila/Audio/AECDebugAudioWriter.swift
+@@ -0,0 +1,137 @@
++import Foundation
++import AVFoundation
++import OSLog
++import TranscriptionCore
++
++private let aecDebugLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "EchoCancellation")
++
++/// Dumps what the echo canceller saw and produced, for tuning on a real Mac:
++/// three 16 kHz mono Float32 WAV files per meeting, in an `aec-debug` folder
++/// next to the recording —
++///
++///   * `<recording>.aec-mic.wav`   the raw microphone, as fed to the canceller
++///   * `<recording>.aec-ref.wav`   the aligned meeting audio actually used as the reference
++///   * `<recording>.aec-clean.wav` the canceller's output
++///
++/// The three files are sample-for-sample parallel, so any of them can be loaded
++/// alongside the others in an audio editor and compared directly. The cleaned
++/// file is exactly what the canceller returned (before any gain the session
++/// applies afterwards), time-aligned with the other two and with the recording.
++///
++/// The canceller's frame observer fires on the main actor with chunks of 1 to
++/// 160 samples (the three arrays of a call always have the same length).
++/// `append` therefore only hops onto a private serial queue; the batching and
++/// the `AVAudioFile` writes happen there. Not used unless the user turned
++/// "Save echo-cancellation debug audio" on.
++///
++/// `@unchecked Sendable`: all mutable state is confined to `queue`.
++final class AECDebugAudioWriter: @unchecked Sendable {
++    /// Samples buffered per file before a write (1 s). Keeps `AVAudioFile`
++    /// from being called 100 times a second with 160 frames.
++    private static let batchSamples = 16_000
++
++    // `.workItem`: release each work item's autoreleased objects when it ends, so
++    // a file dropped in `close()` is really gone (and flushed) when `close()` returns.
++    private let queue = DispatchQueue(label: "io.island.mila.aec-debug-audio", qos: .utility,
++                                      autoreleaseFrequency: .workItem)
++    private var micFile: AVAudioFile?
++    private var refFile: AVAudioFile?
++    private var cleanFile: AVAudioFile?
++    private var pendingMic: [Float] = []
++    private var pendingRef: [Float] = []
++    private var pendingClean: [Float] = []
++    private var loggedWriteFailure = false
++
++    /// Where the files for `recordingURL` go: an `aec-debug` folder beside it.
++    static func directory(for recordingURL: URL) -> URL {
++        recordingURL.deletingLastPathComponent().appendingPathComponent("aec-debug", isDirectory: true)
++    }
++
++    /// Creates the folder and the three (empty) WAV files. Throws if any of
++    /// that fails, in which case no file is left open.
++    init(recordingURL: URL) throws {
++        let directory = Self.directory(for: recordingURL)
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++        let base = recordingURL.deletingPathExtension().lastPathComponent
++        let format = WhisperAudioFormat.pcmFloat32
++        func makeFile(_ role: String) throws -> AVAudioFile {
++            try AVAudioFile(forWriting: directory.appendingPathComponent("\(base).aec-\(role).wav"),
++                            settings: format.settings,
++                            commonFormat: .pcmFormatFloat32,
++                            interleaved: false)
++        }
++        micFile = try makeFile("mic")
++        refFile = try makeFile("ref")
++        cleanFile = try makeFile("clean")
++    }
++
++    /// One observed chunk of any length (the three arrays have the same length).
++    /// Safe to call from any thread; returns immediately.
++    func append(near: [Float], far: [Float], out: [Float]) {
++        queue.async {
++            self.pendingMic.append(contentsOf: near)
++            self.pendingRef.append(contentsOf: far)
++            self.pendingClean.append(contentsOf: out)
++            if self.pendingMic.count >= Self.batchSamples { self.drain() }
++        }
++    }
++
++    /// Write whatever is still buffered and close the files. Blocks until the
++    /// queue has caught up, so everything appended before this call is on disk
++    /// when it returns. Idempotent.
++    func close() {
++        queue.sync {
++            autoreleasepool {
++                drain()
++                Self.finish(micFile)
++                Self.finish(refFile)
++                Self.finish(cleanFile)
++                micFile = nil
++                refFile = nil
++                cleanFile = nil
++            }
++        }
++    }
++
++    /// `AVAudioFile` only finalises a WAV (last buffered frames + header sizes)
++    /// when it is closed. Dropping the reference closes it on deallocation, which
++    /// can be deferred; `close()` (macOS 15+) does it now.
++    static func finish(_ file: AVAudioFile?) {
++        guard let file else { return }
++        if #available(macOS 15.0, *) { file.close() }
++    }
++
++    // MARK: - Queue-confined
++
++    private func drain() {
++        write(&pendingMic, to: micFile)
++        write(&pendingRef, to: refFile)
++        write(&pendingClean, to: cleanFile)
++    }
++
++    private func write(_ samples: inout [Float], to file: AVAudioFile?) {
++        defer { samples.removeAll(keepingCapacity: true) }
++        guard let file, !samples.isEmpty,
++              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
++                                            frameCapacity: AVAudioFrameCount(samples.count)),
++              let channel = buffer.floatChannelData?[0] else { return }
++        buffer.frameLength = AVAudioFrameCount(samples.count)
++        samples.withUnsafeBufferPointer { source in
++            if let base = source.baseAddress { channel.update(from: base, count: samples.count) }
++        }
++        do {
++            try file.write(from: buffer)
++        } catch {
++            guard !loggedWriteFailure else { return }
++            loggedWriteFailure = true
++            // The files live in the user's recordings folder; Cocoa quotes the
++            // folder in `localizedDescription`, so only domain + code are public.
++            let ns = error as NSError
++            aecDebugLog.error("""
++                echo-cancellation debug audio write failed \
++                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
++                \(error.localizedDescription, privacy: .private)
++                """)
++        }
++    }
++}
+diff --git a/Mila/Audio/RecordingSession+EchoCancellation.swift b/Mila/Audio/RecordingSession+EchoCancellation.swift
+new file mode 100644
+index 0000000..f4791c4
+--- /dev/null
++++ b/Mila/Audio/RecordingSession+EchoCancellation.swift
+@@ -0,0 +1,289 @@
++import Foundation
++import AVFoundation
++import OSLog
++import EchoCancellation
++
++private let aecLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "EchoCancellation")
++
++/// The two capture clocks (microphone host time and ScreenCaptureKit
++/// presentation time) are assumed to be the same mach host clock. When the
++/// first timestamps of the two streams are further apart than this they are
++/// not, and the canceller is switched to contiguous (arrival-order) mode.
++private let maxClockMismatchSeconds = 5.0
++
++/// Everything `RecordingSession` needs to know about echo cancellation for the
++/// recording in progress.
++///
++/// Lives in its own object, created once per session, so `RecordingSession.swift`
++/// carries a single stored property and the extension in this file (which cannot
++/// see `RecordingSession`'s `private` members) can reach the state. Touched only
++/// from the main actor, like the session itself.
++final class EchoCancellationSessionState {
++    /// Non-nil only while a MEETING recording that has echo cancellation on is
++    /// running. `startFakeForTesting` never creates one.
++    var stage: EchoCancellationStage?
++
++    /// False once the mic and app-audio clocks were found to disagree: from
++    /// then on no timestamps are passed to the stage (contiguous mode).
++    var timestampsTrusted = true
++
++    /// True when the mic tap was told NOT to apply adaptive gain, so the session
++    /// must apply it to the cleaned samples.
++    var deferredGain = false
++
++    /// The recorder's gain controller, captured on first use. `MicrophoneRecorder.stop()`
++    /// clears `gain`, but the final flush at `RecordingSession.stop()` happens after it.
++    var gain: AdaptiveGainController?
++
++    /// Most recent timestamp seen on each stream, for the one-off clock check.
++    var lastMicTimestamp: Double?
++    var lastReferenceTimestamp: Double?
++    var clockChecked = false
++
++    /// Cleaned samples already pulled out of the stage (by the clock check, which
++    /// can run from the reference path) but not yet handed to the mixer. They
++    /// precede everything the stage emits next, so they are prepended to it.
++    var carry: [Float] = []
++
++    var debugAudio: AECDebugAudioWriter?
++
++    /// Where the settings and the last-meeting summary are read/written.
++    /// `.standard` in the app; tests inject a throwaway suite.
++    var defaults: UserDefaults = .standard
++}
++
++extension RecordingSession {
++
++    // MARK: - Start / teardown
++
++    /// Called by `start()` before the mic starts. Decides whether this recording
++    /// runs the canceller and, if so, arms the timestamp queues and the deferred
++    /// gain. Every other source — and a meeting with the setting off — ends up
++    /// with no stage, disabled queues and gain left in the tap: exactly today's
++    /// behaviour.
++    func beginEchoCancellation(source: RecordingSource, outputURL: URL) {
++        discardEchoCancellation()
++        guard source == .meeting, EchoCancellationSettings.isEnabled(echo.defaults) else { return }
++        guard let stage = EchoCancellationStage(configuration: .init()) else {
++            // Bypass, and say so: the Settings pane shows this line.
++            aecLog.error("echo canceller could not be created — recording this meeting without echo cancellation")
++            EchoCancellationSettings.storeSessionSummary(
++                EchoCancellationSummary.bypassLine(reason: "the echo canceller could not start"),
++                in: echo.defaults)
++            return
++        }
++        activateEchoCancellation(stage: stage, deferGain: true, gain: nil)
++        attachDebugAudioIfEnabled(outputURL: outputURL)
++        aecLog.log("echo cancellation on for this meeting")
++    }
++
++    /// Drop the stage and put the recorders back to their default behaviour.
++    /// Never writes audio. Used by `cancelAll()`, by `start()`'s failure path
++    /// and, after the final flush, by `stop()`.
++    func discardEchoCancellation() {
++        echo.stage?.frameObserver = nil
++        echo.debugAudio?.close()
++        echo.debugAudio = nil
++        echo.stage = nil
++        echo.timestampsTrusted = true
++        echo.deferredGain = false
++        echo.gain = nil
++        echo.lastMicTimestamp = nil
++        echo.lastReferenceTimestamp = nil
++        echo.clockChecked = false
++        echo.carry.removeAll(keepingCapacity: false)
++        mic.timestamps.isEnabled = false
++        mic.timestamps.reset()
++        system.timestamps.isEnabled = false
++        system.timestamps.reset()
++        mic.deferGainToConsumer = false
++    }
++
++    /// Test seam: install (or, with nil, remove) a stage the way `start()` would,
++    /// without a real recorder. Existing tests never call this, so they
++    /// never see a stage. `deferGain: false` models "the tap already applied
++    /// gain" (the setting was off for the tap), `gain` is the controller the
++    /// session applies when it is deferred, and `defaults` is where the session
++    /// reads the debug-audio setting and writes its summary.
++    func installEchoStageForTesting(_ stage: EchoCancellationStage?,
++                                    deferGain: Bool,
++                                    gain: AdaptiveGainController? = nil,
++                                    defaults: UserDefaults = .standard) {
++        discardEchoCancellation()
++        echo.defaults = defaults
++        guard let stage else { return }
++        activateEchoCancellation(stage: stage, deferGain: deferGain, gain: gain)
++        attachDebugAudioIfEnabled(outputURL: fileURL)
++    }
++
++    private func activateEchoCancellation(stage: EchoCancellationStage,
++                                          deferGain: Bool,
++                                          gain: AdaptiveGainController?) {
++        echo.stage = stage
++        echo.deferredGain = deferGain
++        echo.gain = gain
++        echo.timestampsTrusted = true
++        echo.lastMicTimestamp = nil
++        echo.lastReferenceTimestamp = nil
++        echo.clockChecked = false
++        echo.carry.removeAll(keepingCapacity: false)
++        // Fresh queues, THEN enabled: nothing pushed for an earlier recording
++        // may be popped as this one's first timestamp.
++        mic.timestamps.reset()
++        system.timestamps.reset()
++        mic.timestamps.isEnabled = true
++        system.timestamps.isEnabled = true
++        mic.deferGainToConsumer = deferGain
++    }
++
++    // MARK: - Per-buffer path
++
++    /// App audio for the reference. Called from `consumeSystem`'s meeting branch
++    /// with the timestamp popped for THIS buffer.
++    func echoAppendReference(_ samples: [Float], hostTime ts: Double?) {
++        guard let stage = echo.stage else { return }
++        if let ts { echo.lastReferenceTimestamp = ts }
++        checkClockBasis(stage)
++        stage.appendReference(samples, hostTimeSeconds: echo.timestampsTrusted ? ts : nil)
++    }
++
++    /// Cancel the echo in one mic buffer. Returns nil when this recording has no
++    /// stage (the caller then takes today's path untouched); otherwise the
++    /// cleaned — and, if the tap deferred it, gained — samples that are ready,
++    /// which can be more or fewer than `samples.count` and empty.
++    ///
++    /// TODO(aec): a mid-session mic rebuild (input device change) jumps the mic
++    /// timestamps and the stage re-anchors on its own. The echo PATH also changes
++    /// then (different microphone, different gain), so resetting the filter on an
++    /// input-device change (`resetTimeline(resetFilter: true)`) could help. Not
++    /// done: `MicrophoneRecorder` posts no event for it and resetting on every
++    /// configuration notice would throw away a converged filter for nothing.
++    func echoProcessMic(_ samples: [Float], hostTime ts: Double?) -> [Float]? {
++        guard let stage = echo.stage else { return nil }
++        if let ts { echo.lastMicTimestamp = ts }
++        checkClockBasis(stage)
++        var ready = echo.carry
++        echo.carry.removeAll(keepingCapacity: true)
++        let clean = stage.processMicrophone(samples, hostTimeSeconds: echo.timestampsTrusted ? ts : nil)
++        ready.append(contentsOf: applyDeferredGain(clean))
++        return ready
++    }
++
++    /// Pull everything the stage still holds out of it (missing reference counts
++    /// as silence), then restart its timeline. For pause and stop; the caller
++    /// mixes the result and writes it. Empty when there is no stage.
++    func echoFlushHeldMic() -> [Float] {
++        guard let stage = echo.stage else { return [] }
++        var ready = echo.carry
++        echo.carry.removeAll(keepingCapacity: true)
++        ready.append(contentsOf: applyDeferredGain(stage.flush()))
++        stage.resetTimeline(resetFilter: false)
++        return ready
++    }
++
++    /// Called by `stop()` once the held mic audio has been written: log the
++    /// stage's numbers, store the one-line summary for Settings, release
++    /// everything.
++    func finishEchoCancellation() {
++        defer { discardEchoCancellation() }
++        guard let stage = echo.stage else { return }
++        let s = stage.statistics
++        // Numbers only — no content. `.public` so a diagnostic bundle can show how
++        // a meeting went.
++        aecLog.log("""
++            echo cancellation finished: frames=\(s.framesProcessed, privacy: .public) \
++            withReference=\(s.framesWithReference, privacy: .public) \
++            heldTooLong=\(s.framesHeldTooLong, privacy: .public) \
++            micReanchors=\(s.micReanchors, privacy: .public) \
++            referenceReanchors=\(s.referenceReanchors, privacy: .public) \
++            referenceSamplesDiscarded=\(s.referenceSamplesDiscarded, privacy: .public) \
++            reductionDb=\(s.echoReductionDb ?? -1, privacy: .public) \
++            delayMs=\(s.estimatedEchoDelayMs ?? -1, privacy: .public) \
++            initialOffsetMs=\(s.initialMicToReferenceOffsetMs ?? 0, privacy: .public) \
++            timestampsTrusted=\(self.echo.timestampsTrusted, privacy: .public) \
++            micQueueOverflows=\(self.mic.timestamps.overflowCount, privacy: .public) \
++            systemQueueOverflows=\(self.system.timestamps.overflowCount, privacy: .public)
++            """)
++        let line = EchoCancellationSummary.sessionLine(
++            framesProcessed: s.framesProcessed,
++            framesWithReference: s.framesWithReference,
++            echoReductionDb: s.echoReductionDb,
++            estimatedEchoDelayMs: s.estimatedEchoDelayMs,
++            timestampsTrusted: echo.timestampsTrusted)
++        EchoCancellationSettings.storeSessionSummary(line, in: echo.defaults)
++    }
++
++    // MARK: - Internals
++
++    /// Gain AFTER the canceller. Gain that moves underneath an adaptive echo
++    /// filter looks like a changing echo path, so when echo cancellation is on
++    /// the tap leaves the signal alone and the controller runs here instead —
++    /// on the main actor, the only caller of `process` while recording (the
++    /// tap stopped calling it when `deferGainToConsumer` was set).
++    private func applyDeferredGain(_ samples: [Float]) -> [Float] {
++        guard echo.deferredGain, !samples.isEmpty else { return samples }
++        // `MicrophoneRecorder` builds the controller in `start()`, which has
++        // returned by the time the first buffer arrives. Keep our own reference:
++        // its `stop()` clears `gain` before the session's final flush.
++        if echo.gain == nil { echo.gain = mic.gain }
++        guard let gain = echo.gain else { return samples }
++        return gain.process(samples)
++    }
++
++    /// Once per recording, when both streams have produced a timestamp: check
++    /// that they are on the same clock. ScreenCaptureKit stamps its buffers on
++    /// the host time clock, like `AVAudioTime` — an assumption about a system
++    /// framework that is verified here rather than trusted.
++    ///
++    /// Compares each stream's NEWEST timestamp at the moment the second stream
++    /// delivers its first, i.e. "what time does each clock say it is right now".
++    /// (Comparing first timestamps would flag a perfectly healthy meeting whose
++    /// far end was silent for the first few seconds — ScreenCaptureKit delivers
++    /// nothing until the app makes a sound.)
++    ///
++    /// On a mismatch the canceller keeps working in contiguous mode: held mic
++    /// audio is flushed (and handed to the mixer ahead of whatever comes next),
++    /// the timeline is reset, and from here on no timestamps are passed in.
++    private func checkClockBasis(_ stage: EchoCancellationStage) {
++        guard !echo.clockChecked,
++              let micNow = echo.lastMicTimestamp,
++              let referenceNow = echo.lastReferenceTimestamp else { return }
++        echo.clockChecked = true
++        let gap = abs(micNow - referenceNow)
++        guard gap > maxClockMismatchSeconds else {
++            aecLog.log("capture clocks agree: mic and app-audio timestamps are \(gap, privacy: .public)s apart")
++            return
++        }
++        echo.timestampsTrusted = false
++        echo.carry.append(contentsOf: applyDeferredGain(stage.flush()))
++        stage.resetTimeline(resetFilter: false)
++        aecLog.error("mic and app-audio capture clocks disagree by \(gap, privacy: .public)s (> \(maxClockMismatchSeconds, privacy: .public)s) — echo cancellation falls back to arrival-order alignment")
++    }
++
++    /// Write the raw mic, the aligned reference and the cleaned mic to
++    /// `<recordings>/aec-debug/` — only when the user asked for it.
++    private func attachDebugAudioIfEnabled(outputURL: URL?) {
++        guard let stage = echo.stage, let outputURL,
++              EchoCancellationSettings.savesDebugAudio(echo.defaults) else { return }
++        do {
++            let writer = try AECDebugAudioWriter(recordingURL: outputURL)
++            echo.debugAudio = writer
++            // Fires on the main actor with aligned chunks of 1...160 samples
++            // (out == what the stage returned); `append` only hops onto the
++            // writer's own queue.
++            stage.frameObserver = { near, far, out in
++                writer.append(near: near, far: far, out: out)
++            }
++            aecLog.log("echo-cancellation debug audio is being saved")
++        } catch {
++            // The folder is the user's recordings folder, which Cocoa quotes in
++            // `localizedDescription`; domain + code say what failed.
++            let ns = error as NSError
++            aecLog.error("""
++                could not create the echo-cancellation debug audio files \
++                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
++                \(error.localizedDescription, privacy: .private)
++                """)
++        }
++    }
++}
+diff --git a/Mila/Audio/RecordingSession.swift b/Mila/Audio/RecordingSession.swift
+index 81a2e75..245fa71 100644
+--- a/Mila/Audio/RecordingSession.swift
++++ b/Mila/Audio/RecordingSession.swift
+@@ -100,6 +100,11 @@ final class RecordingSession: ObservableObject {
+     /// is why the live feed never starves the way the old mic/system
+     /// pairing did.
+     private var pendingSystem: [Float] = []
++    /// Echo-cancellation state for the recording in progress. The logic lives in
++    /// `RecordingSession+EchoCancellation.swift`; `echo.stage` is nil — and every
++    /// echo call below a no-op — unless a MEETING recording started with the
++    /// setting on.
++    let echo = EchoCancellationSessionState()
+     /// Cap on the system jitter buffer (~30s @ 16kHz). Generous so normal SCK
+     /// bursts / clock skew just *delay* app audio (the mic clock catches back
+     /// up) instead of losing it; only a genuinely stuck mic clock reaches the
+@@ -143,6 +148,8 @@ final class RecordingSession: ObservableObject {
+         // the last stop() ran its flush can append to `pendingSystem`
+         // after the flush, and stop() doesn't clear the buffer.
+         pendingSystem.removeAll(keepingCapacity: false)
++        // Stage, timestamp queues and deferred gain are set up BEFORE the mic starts.
++        beginEchoCancellation(source: source, outputURL: outputURL)
+ 
+         do {
+             let format = WhisperAudioFormat.pcmFloat32
+@@ -205,6 +212,8 @@ final class RecordingSession: ObservableObject {
+             audioFile = nil
+             fileURL = nil
+             pendingSystem.removeAll(keepingCapacity: false)
++            // A failed bring-up must not leave a stage or armed queues behind.
++            discardEchoCancellation()
+             throw error
+         }
+ 
+@@ -269,6 +278,11 @@ final class RecordingSession: ObservableObject {
+         // Flip the gate FIRST so nothing else lands in `pendingSystem` while
+         // the flush below awaits.
+         state = .paused
++        // Mic audio the echo canceller is still holding (it waits up to ~150 ms
++        // for the reference) is audio from BEFORE the pause — write it now, ahead
++        // of the system tail below, then restart the stage's timeline for
++        // whatever comes after resume.
++        await mixAndWriteCleanedMic(echoFlushHeldMic())
+         // Meeting mode parks system audio here for the mic clock to consume.
+         // Whatever is parked at the pause instant is audio the other side
+         // already produced BEFORE the pause, so write it out (system-only, at
+@@ -332,6 +346,31 @@ final class RecordingSession: ObservableObject {
+         startElapsedTimer()
+     }
+ 
++    /// Test seam: like `startFakeForTesting`, but a MEETING session that writes a
++    /// real WAV, so a test can read back what the echo canceller and the mixer
++    /// produced. No mic or ScreenCaptureKit bring-up; the test drives
++    /// `consumeMic` / `consumeSystem` directly. Not used by the app or by any
++    /// other test.
++    func startFakeMeetingForTesting(outputURL: URL) async throws {
++        guard state == .idle else { return }
++        let format = WhisperAudioFormat.pcmFloat32
++        self.audioFile = try AVAudioFile(forWriting: outputURL, settings: format.settings,
++                                         commonFormat: .pcmFormatFloat32, interleaved: false)
++        self.source = .meeting
++        self.fileURL = outputURL
++        self.writesSinceStart = 0
++        self.systemBuffersSinceStart = 0
++        self.overflowFlushesSinceStart = 0
++        self.isFakeForTesting = true
++        pendingSystem.removeAll(keepingCapacity: false)
++        startTime = Date()
++        pausedAt = nil
++        totalPaused = 0
++        captureEpoch += 1
++        state = .recording
++        startElapsedTimer()
++    }
++
+     func stop() async -> URL? {
+         guard state == .recording || state == .paused else { return fileURL }
+         state = .stopping
+@@ -347,6 +386,12 @@ final class RecordingSession: ObservableObject {
+         systemTask?.cancel(); systemTask = nil
+         timerTask?.cancel(); timerTask = nil
+ 
++        // Write the mic audio the echo canceller is still holding, THEN log its
++        // statistics, store the Settings summary and release it — all before the
++        // system tail goes out. `write` does not look at `state`, so doing this
++        // while `.stopping` is fine.
++        await mixAndWriteCleanedMic(echoFlushHeldMic())
++        finishEchoCancellation()
+         await flushPendingSystemTail()
+         recLog.log("stop: source=\(self.source.rawValue, privacy: .public) micFrames=\(micFrames, privacy: .public) systemBuffers=\(self.systemBuffersSinceStart, privacy: .public) writes=\(self.writesSinceStart, privacy: .public)")
+         if (source == .microphone || source == .meeting) && micFrames == 0 {
+@@ -359,6 +404,9 @@ final class RecordingSession: ObservableObject {
+             recLog.error("recording stopped with 0 system-audio buffers (source=\(self.source.rawValue, privacy: .public)) — the app-audio leg delivered nothing")
+         }
+         let url = fileURL
++        // Finalise the WAV now rather than whenever the file object is released,
++        // so it is complete on disk when `stop()` returns.
++        AECDebugAudioWriter.finish(audioFile)
+         audioFile = nil
+         fileURL = nil
+         startTime = nil
+@@ -389,6 +437,8 @@ final class RecordingSession: ObservableObject {
+         meters.elapsed = 0
+         isFakeForTesting = false
+         pendingSystem.removeAll(keepingCapacity: false)
++        // Drop the stage and disarm the queues; no writes.
++        discardEchoCancellation()
+         state = .idle
+     }
+ 
+@@ -398,6 +448,9 @@ final class RecordingSession: ObservableObject {
+     /// buffers through the REAL mic path of a fake session and count who
+     /// publishes; nothing in the app calls it from outside this file.
+     func consumeMic(_ buffer: AVAudioPCMBuffer) async {
++        // Pop THIS buffer's capture timestamp before any early return, so the
++        // queue stays aligned with the stream even for buffers dropped while paused.
++        let micTimestamp = mic.timestamps.pop()
+         // Paused: discard the buffer entirely so nothing reaches the WAV or
+         // the live transcriber. The engine keeps running; we just drop its
+         // output until `resume()`.
+@@ -416,6 +469,12 @@ final class RecordingSession: ObservableObject {
+             await write(samples)
+             return
+         }
++        // Echo-cancel the mic against the app audio BEFORE mixing. `nil` = no stage
++        // for this recording → fall through to the path below.
++        if let clean = echoProcessMic(samples, hostTime: micTimestamp) {
++            await mixAndWriteCleanedMic(clean)
++            return
++        }
+         // Meeting mode: the mic is the master clock. Each mic chunk pulls an
+         // equal span of system audio out of `pendingSystem` (silence where
+         // the app wasn't playing) and mixes the two, then drives BOTH the
+@@ -429,7 +488,10 @@ final class RecordingSession: ObservableObject {
+         await write(mixed)
+     }
+ 
+-    private func consumeSystem(_ buffer: AVAudioPCMBuffer) async {
++    /// Internal (not private) so tests can drive it, like `consumeMic`.
++    func consumeSystem(_ buffer: AVAudioPCMBuffer) async {
++        // Pop THIS buffer's capture timestamp before the pause gate.
++        let systemTimestamp = system.timestamps.pop()
+         // Paused: drop system audio too (both the inline `.systemAudio`
+         // write and the `.meeting` jitter-buffer append) so the paused span
+         // is absent from the recording.
+@@ -444,6 +506,8 @@ final class RecordingSession: ObservableObject {
+             await write(samples)
+             return
+         }
++        // The same audio is the echo canceller's reference; a no-op without a stage.
++        echoAppendReference(samples, hostTime: systemTimestamp)
+         // Meeting mode: park the system audio for the mic clock to consume
+         // in `consumeMic`. Bound the backlog so a stalled mic clock can't grow
+         // it without limit. The cap is generous (~30s), so an SCK burst at
+@@ -501,6 +565,18 @@ final class RecordingSession: ObservableObject {
+         return mixed
+     }
+ 
++    /// Mix a chunk of echo-cancelled mic audio with the buffered
++    /// system audio and send the result to the live feed and the WAV — exactly
++    /// what `consumeMic` does with a raw chunk, for audio that came out of the
++    /// echo canceller instead. The chunk can be any length, including empty (the
++    /// canceller holds frames until their reference has arrived).
++    private func mixAndWriteCleanedMic(_ clean: [Float]) async {
++        guard !clean.isEmpty else { return }
++        let mixed = mixWithBufferedSystem(mic: clean)
++        if let onLive = onLiveSamples { onLive(mixed[0..<mixed.count]) }
++        await write(mixed)
++    }
++
+     /// Flush any system audio still buffered when the mic clock stops
+     /// (meeting mode only — `.microphone` / `.systemAudio` write inline, so
+     /// `pendingSystem` is empty for them). The mic is already torn down by
+diff --git a/Mila/Models/EchoCancellationSettings.swift b/Mila/Models/EchoCancellationSettings.swift
+new file mode 100644
+index 0000000..9649984
+--- /dev/null
++++ b/Mila/Models/EchoCancellationSettings.swift
+@@ -0,0 +1,147 @@
++import Foundation
++import Combine
++
++/// User settings for removing speaker echo from MEETING recordings: the microphone is run through an acoustic echo
++/// canceller, with the meeting app's audio (which Mila already captures) as the
++/// reference, before the two are mixed. See `RecordingSession+EchoCancellation`.
++///
++/// Same shape as `AudioInputSettings` / `VoiceRecognitionSettings`:
++/// `@Published` properties that write through to namespaced `UserDefaults`
++/// keys, with an injectable `defaults` suite so tests never touch the user's
++/// real preferences.
++///
++/// **Code defaults: everything OFF.** With no stored preference Mila records
++/// exactly as it did before this setting existed. This file never registers
++/// defaults (`register(defaults:)` is process-wide and would leak into every
++/// test suite); an unset key simply means the code default, which is why every
++/// read goes through `object(forKey:)` rather than `bool(forKey:)` — the code
++/// default stays the single source of truth, and a stray non-Bool value falls
++/// back to it.
++///
++/// `RecordingSession` reads these through the static helpers at record-start, so
++/// a change applies to the NEXT recording, never to one already running.
++@MainActor
++final class EchoCancellationSettings: ObservableObject {
++
++    enum Keys {
++        static let enabled = "echoCancellation.enabled"
++        static let saveDebugAudio = "echoCancellation.saveDebugAudio"
++        /// Written by `RecordingSession` when a meeting that used (or tried to
++        /// use) the canceller stops. Absent until the first such meeting.
++        static let lastSessionSummary = "echoCancellation.lastSessionSummary"
++    }
++
++    /// Run meeting recordings' microphone through the echo canceller.
++    @Published var enabled: Bool {
++        didSet {
++            guard enabled != oldValue else { return }
++            defaults.set(enabled, forKey: Keys.enabled)
++        }
++    }
++
++    /// Also write the raw mic, the aligned meeting audio and the cleaned mic as
++    /// three WAV files per meeting, for tuning.
++    @Published var saveDebugAudio: Bool {
++        didSet {
++            guard saveDebugAudio != oldValue else { return }
++            defaults.set(saveDebugAudio, forKey: Keys.saveDebugAudio)
++        }
++    }
++
++    /// One line describing how echo cancellation went in the last meeting that
++    /// used it, e.g. "echo reduced ≈18 dB · echo delay ≈42 ms · reference
++    /// present 63% of the time" or "bypassed: …". Read-only for the UI; the
++    /// session writes the defaults key directly, so call
++    /// `refreshLastSessionSummary()` when the settings view appears.
++    @Published private(set) var lastSessionSummary: String?
++
++    private let defaults: UserDefaults
++
++    init(defaults: UserDefaults = .standard) {
++        self.defaults = defaults
++        self.enabled = Self.isEnabled(defaults)
++        self.saveDebugAudio = Self.savesDebugAudio(defaults)
++        self.lastSessionSummary = Self.storedSessionSummary(defaults)
++    }
++
++    /// Re-read the summary the last meeting stored.
++    func refreshLastSessionSummary() {
++        let latest = Self.storedSessionSummary(defaults)
++        if latest != lastSessionSummary { lastSessionSummary = latest }
++    }
++
++    // MARK: - Reads/writes used outside the UI
++
++    static func isEnabled(_ defaults: UserDefaults) -> Bool {
++        flag(Keys.enabled, in: defaults, codeDefault: false)
++    }
++
++    static func savesDebugAudio(_ defaults: UserDefaults) -> Bool {
++        flag(Keys.saveDebugAudio, in: defaults, codeDefault: false)
++    }
++
++    /// An unset (or non-Bool) key means `codeDefault`.
++    private static func flag(_ key: String, in defaults: UserDefaults, codeDefault: Bool) -> Bool {
++        (defaults.object(forKey: key) as? Bool) ?? codeDefault
++    }
++
++    static func storedSessionSummary(_ defaults: UserDefaults) -> String? {
++        guard let text = defaults.string(forKey: Keys.lastSessionSummary), !text.isEmpty else { return nil }
++        return text
++    }
++
++    /// Record the outcome of the meeting that just ended. A nil or empty
++    /// summary removes the key.
++    static func storeSessionSummary(_ summary: String?, in defaults: UserDefaults) {
++        if let summary, !summary.isEmpty {
++            defaults.set(summary, forKey: Keys.lastSessionSummary)
++        } else {
++            defaults.removeObject(forKey: Keys.lastSessionSummary)
++        }
++    }
++}
++
++/// Builds the human-readable "Last meeting: …" line. Pure and free of user
++/// content (numbers only), so it is safe to log and trivial to test. Takes
++/// primitives rather than the canceller's `Statistics` value so it can be tested
++/// without constructing one.
++enum EchoCancellationSummary {
++    static func sessionLine(framesProcessed: Int,
++                            framesWithReference: Int,
++                            echoReductionDb: Double?,
++                            estimatedEchoDelayMs: Double?,
++                            timestampsTrusted: Bool) -> String {
++        var parts: [String] = []
++        if let db = echoReductionDb.flatMap(Self.whole) {
++            parts.append("echo reduced ≈\(db) dB")
++        } else {
++            parts.append("echo reduction not measured")
++        }
++        if let ms = estimatedEchoDelayMs.flatMap(Self.whole) {
++            parts.append("echo delay ≈\(ms) ms")
++        }
++        if framesProcessed > 0 {
++            let share = 100.0 * Double(framesWithReference) / Double(framesProcessed)
++            parts.append("reference present \(Self.whole(share) ?? 0)% of the time")
++        } else {
++            parts.append("no microphone audio was processed")
++        }
++        if !timestampsTrusted {
++            parts.append("clocks disagreed, aligned by arrival order")
++        }
++        return parts.joined(separator: " · ")
++    }
++
++    /// The line stored when the canceller could not run for this meeting.
++    static func bypassLine(reason: String) -> String {
++        "bypassed: \(reason)"
++    }
++
++    /// `x` rounded to a whole number, or nil for NaN / ±infinity (an `Int(_:)`
++    /// of those traps). Magnitudes are clamped so a pathological statistic
++    /// cannot produce a ten-digit figure in the UI.
++    private static func whole(_ x: Double) -> Int? {
++        guard x.isFinite else { return nil }
++        return Int(max(-999, min(999, x)).rounded())
++    }
++}
+diff --git a/Mila/Views/EchoCancellationSettingsSection.swift b/Mila/Views/EchoCancellationSettingsSection.swift
+new file mode 100644
+index 0000000..98e5f7f
+--- /dev/null
++++ b/Mila/Views/EchoCancellationSettingsSection.swift
+@@ -0,0 +1,51 @@
++import SwiftUI
++
++/// The "remove speaker echo" controls, embedded in Settings → Audio beneath the
++/// automatic-gain toggle — both are "what happens to the microphone signal"
++/// settings.
++///
++/// Carries its own leading divider so the host needs exactly one line.
++struct EchoCancellationSettingsSection: View {
++    @EnvironmentObject private var settings: EchoCancellationSettings
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 12) {
++            Divider().padding(.vertical, 4)
++
++            VStack(alignment: .leading, spacing: 4) {
++                Toggle("Remove speaker echo from meeting recordings",
++                       isOn: $settings.enabled)
++                    .toggleStyle(.switch)
++                    .accessibilityIdentifier("audio.echoCancellation.toggle")
++                Text("When you use speakers instead of headphones, your microphone also records the other participants. Mila removes that echo using the meeting audio it already captures. Works in Meeting recordings only. Changes apply to the next recording.")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++                    .fixedSize(horizontal: false, vertical: true)
++            }
++
++            VStack(alignment: .leading, spacing: 4) {
++                Toggle("Save echo-cancellation debug audio",
++                       isOn: $settings.saveDebugAudio)
++                    .toggleStyle(.switch)
++                    .accessibilityIdentifier("audio.echoCancellation.debugAudioToggle")
++                Text("Saves three extra WAV files per meeting (raw mic, aligned meeting audio, cleaned mic) in an aec-debug folder inside your recordings folder, for tuning. Delete them when done.")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++                    .fixedSize(horizontal: false, vertical: true)
++            }
++
++            if let summary = settings.lastSessionSummary {
++                Text("Last meeting: \(summary)")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++                    .fixedSize(horizontal: false, vertical: true)
++                    .textSelection(.enabled)
++                    .accessibilityIdentifier("audio.echoCancellation.lastMeeting")
++            }
++        }
++        // The session writes the summary straight to UserDefaults when a
++        // meeting stops, so pick up a meeting that ended while Settings was
++        // closed.
++        .onAppear { settings.refreshLastSessionSummary() }
++    }
++}
+diff --git a/Mila/Views/SettingsView.swift b/Mila/Views/SettingsView.swift
+index 4983b42..30f3cbd 100644
+--- a/Mila/Views/SettingsView.swift
++++ b/Mila/Views/SettingsView.swift
+@@ -428,6 +428,8 @@ private struct AudioSettingsTab: View {
+                     .fixedSize(horizontal: false, vertical: true)
+             }
+ 
++            EchoCancellationSettingsSection()
++
+             Spacer()
+         }
+         .frame(maxWidth: .infinity, alignment: .leading)
+diff --git a/MilaTests/EchoCancellationSettingsTests.swift b/MilaTests/EchoCancellationSettingsTests.swift
+new file mode 100644
+index 0000000..752c436
+--- /dev/null
++++ b/MilaTests/EchoCancellationSettingsTests.swift
+@@ -0,0 +1,174 @@
++import XCTest
++@testable import Mila
++
++/// The settings object, its UserDefaults contract (the keys are read by
++/// `RecordingSession` through the static helpers) and the one-line
++/// "Last meeting" summary.
++@MainActor
++final class EchoCancellationSettingsTests: XCTestCase {
++
++    /// A throwaway suite so no test touches `UserDefaults.standard`.
++    private func freshDefaults() -> UserDefaults {
++        let suite = "EchoCancellationSettingsTests.\(UUID().uuidString)"
++        let defaults = UserDefaults(suiteName: suite)!
++        defaults.removePersistentDomain(forName: suite)
++        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
++        return defaults
++    }
++
++    // MARK: - Defaults and persistence
++
++    /// The code default is today's behaviour: with nothing stored, nothing changes.
++    func test_everything_defaults_off_and_there_is_no_summary() {
++        let defaults = freshDefaults()
++        let settings = EchoCancellationSettings(defaults: defaults)
++        XCTAssertFalse(settings.enabled)
++        XCTAssertFalse(settings.saveDebugAudio)
++        XCTAssertNil(settings.lastSessionSummary)
++        XCTAssertFalse(EchoCancellationSettings.isEnabled(defaults))
++        XCTAssertFalse(EchoCancellationSettings.savesDebugAudio(defaults))
++    }
++
++    func test_keys_are_the_shared_contract() {
++        XCTAssertEqual(EchoCancellationSettings.Keys.enabled, "echoCancellation.enabled")
++        XCTAssertEqual(EchoCancellationSettings.Keys.saveDebugAudio, "echoCancellation.saveDebugAudio")
++        XCTAssertEqual(EchoCancellationSettings.Keys.lastSessionSummary, "echoCancellation.lastSessionSummary")
++    }
++
++    func test_toggles_write_through_and_survive_a_relaunch() {
++        let defaults = freshDefaults()
++        let settings = EchoCancellationSettings(defaults: defaults)
++        settings.enabled = true
++        settings.saveDebugAudio = true
++        XCTAssertTrue(defaults.bool(forKey: "echoCancellation.enabled"))
++        XCTAssertTrue(defaults.bool(forKey: "echoCancellation.saveDebugAudio"))
++        XCTAssertTrue(EchoCancellationSettings.isEnabled(defaults))
++        XCTAssertTrue(EchoCancellationSettings.savesDebugAudio(defaults))
++
++        let relaunched = EchoCancellationSettings(defaults: defaults)
++        XCTAssertTrue(relaunched.enabled)
++        XCTAssertTrue(relaunched.saveDebugAudio)
++
++        relaunched.enabled = false
++        XCTAssertFalse(EchoCancellationSettings.isEnabled(defaults))
++    }
++
++    /// A value written to the key from outside the settings object (for example
++    /// `defaults write`) is an ordinary stored value: it must be honoured, and
++    /// the user must be able to override it. (`register(defaults:)` is
++    /// deliberately not used anywhere — it is process-wide and would leak into
++    /// every suite.)
++    func test_a_value_written_for_an_unset_key_is_honoured_and_user_changes_win() {
++        let defaults = freshDefaults()
++        XCTAssertNil(defaults.object(forKey: "echoCancellation.enabled"), "precondition: unset")
++
++        defaults.set(true, forKey: "echoCancellation.enabled")        // written from outside, e.g. `defaults write`
++        XCTAssertTrue(EchoCancellationSettings.isEnabled(defaults))
++        let settings = EchoCancellationSettings(defaults: defaults)
++        XCTAssertTrue(settings.enabled)
++
++        settings.enabled = false                                      // the user turns it off
++        XCTAssertFalse(EchoCancellationSettings.isEnabled(defaults))
++        XCTAssertFalse(EchoCancellationSettings(defaults: defaults).enabled)
++    }
++
++    /// Unset means the code default; a stray non-Bool value must not read as ON.
++    func test_unset_or_malformed_values_read_as_the_code_default() {
++        let defaults = freshDefaults()
++        XCTAssertFalse(EchoCancellationSettings.isEnabled(defaults))
++        defaults.set("yes", forKey: "echoCancellation.enabled")
++        XCTAssertFalse(EchoCancellationSettings.isEnabled(defaults), "a String is not a Bool")
++        defaults.set("yes", forKey: "echoCancellation.saveDebugAudio")
++        XCTAssertFalse(EchoCancellationSettings.savesDebugAudio(defaults))
++    }
++
++    // MARK: - Last-meeting summary
++
++    func test_stored_summary_is_read_at_init_and_on_refresh() {
++        let defaults = freshDefaults()
++        let settings = EchoCancellationSettings(defaults: defaults)
++        XCTAssertNil(settings.lastSessionSummary)
++
++        // The session writes the key directly when a meeting stops.
++        EchoCancellationSettings.storeSessionSummary("echo reduced ≈18 dB", in: defaults)
++        XCTAssertNil(settings.lastSessionSummary, "not live: the view refreshes on appear")
++        settings.refreshLastSessionSummary()
++        XCTAssertEqual(settings.lastSessionSummary, "echo reduced ≈18 dB")
++
++        XCTAssertEqual(EchoCancellationSettings(defaults: defaults).lastSessionSummary,
++                       "echo reduced ≈18 dB")
++    }
++
++    func test_storing_an_empty_or_nil_summary_clears_it() {
++        let defaults = freshDefaults()
++        EchoCancellationSettings.storeSessionSummary("something", in: defaults)
++        XCTAssertNotNil(EchoCancellationSettings.storedSessionSummary(defaults))
++
++        EchoCancellationSettings.storeSessionSummary("", in: defaults)
++        XCTAssertNil(EchoCancellationSettings.storedSessionSummary(defaults))
++        XCTAssertNil(defaults.object(forKey: "echoCancellation.lastSessionSummary"))
++
++        EchoCancellationSettings.storeSessionSummary("again", in: defaults)
++        EchoCancellationSettings.storeSessionSummary(nil, in: defaults)
++        XCTAssertNil(EchoCancellationSettings.storedSessionSummary(defaults))
++    }
++
++    func test_summary_does_not_leak_into_the_toggle_keys() {
++        let defaults = freshDefaults()
++        EchoCancellationSettings.storeSessionSummary("echo reduced ≈18 dB", in: defaults)
++        XCTAssertFalse(EchoCancellationSettings.isEnabled(defaults))
++        XCTAssertFalse(EchoCancellationSettings.savesDebugAudio(defaults))
++    }
++
++    // MARK: - Summary line
++
++    func test_summary_line_matches_the_documented_shape() {
++        let line = EchoCancellationSummary.sessionLine(framesProcessed: 1_000,
++                                                       framesWithReference: 630,
++                                                       echoReductionDb: 18.4,
++                                                       estimatedEchoDelayMs: 41.6,
++                                                       timestampsTrusted: true)
++        XCTAssertEqual(line, "echo reduced ≈18 dB · echo delay ≈42 ms · reference present 63% of the time")
++    }
++
++    func test_summary_line_degrades_gracefully_when_nothing_was_measured() {
++        let line = EchoCancellationSummary.sessionLine(framesProcessed: 400,
++                                                       framesWithReference: 0,
++                                                       echoReductionDb: nil,
++                                                       estimatedEchoDelayMs: nil,
++                                                       timestampsTrusted: true)
++        XCTAssertEqual(line, "echo reduction not measured · reference present 0% of the time")
++
++        let empty = EchoCancellationSummary.sessionLine(framesProcessed: 0,
++                                                        framesWithReference: 0,
++                                                        echoReductionDb: nil,
++                                                        estimatedEchoDelayMs: nil,
++                                                        timestampsTrusted: true)
++        XCTAssertEqual(empty, "echo reduction not measured · no microphone audio was processed")
++    }
++
++    func test_summary_line_flags_untrusted_timestamps() {
++        let line = EchoCancellationSummary.sessionLine(framesProcessed: 100,
++                                                       framesWithReference: 100,
++                                                       echoReductionDb: 12,
++                                                       estimatedEchoDelayMs: nil,
++                                                       timestampsTrusted: false)
++        XCTAssertTrue(line.hasSuffix("clocks disagreed, aligned by arrival order"), line)
++    }
++
++    /// `Int(_:)` of NaN or infinity traps, and an ERLE of +∞ is exactly what a
++    /// perfectly silent output would give.
++    func test_summary_line_survives_non_finite_statistics() {
++        let line = EchoCancellationSummary.sessionLine(framesProcessed: 10,
++                                                       framesWithReference: 10,
++                                                       echoReductionDb: .infinity,
++                                                       estimatedEchoDelayMs: .nan,
++                                                       timestampsTrusted: true)
++        XCTAssertEqual(line, "echo reduction not measured · reference present 100% of the time")
++    }
++
++    func test_bypass_line() {
++        XCTAssertEqual(EchoCancellationSummary.bypassLine(reason: "the echo canceller could not start"),
++                       "bypassed: the echo canceller could not start")
++    }
++}
+diff --git a/MilaTests/RecordingSessionEchoCancellationTests.swift b/MilaTests/RecordingSessionEchoCancellationTests.swift
+new file mode 100644
+index 0000000..ec18c06
+--- /dev/null
++++ b/MilaTests/RecordingSessionEchoCancellationTests.swift
+@@ -0,0 +1,846 @@
++import XCTest
++import AVFoundation
++import TranscriptionCore
++import EchoCancellation
++@testable import Mila
++
++// Drives a fake MEETING `RecordingSession` (a real WAV, no mic / ScreenCaptureKit
++// bring-up) through its real `consumeMic` / `consumeSystem` / `pause` / `stop`
++// paths with synthetic audio: a speech-like far-end signal, and a microphone that
++// hears only its echo (a few delayed, scaled copies). Capture timestamps are
++// pushed into the recorders' queues exactly as the capture callbacks would.
++//
++// Every signal is generated from a seeded SplitMix64, so the runs are
++// deterministic. The numbers were calibrated against the vendored SpeexDSP in a
++// C harness (default filter, 30 ms lead): the cancellation measured there is
++// ~40 dB in steady state, against the 10 dB these tests require.
++
++// MARK: - Deterministic signals
++
++private struct SplitMix64 {
++    var state: UInt64
++    init(seed: UInt64) { state = seed }
++
++    mutating func next() -> UInt64 {
++        state = state &+ 0x9E37_79B9_7F4A_7C15
++        var z = state
++        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
++        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
++        return z ^ (z >> 31)
++    }
++
++    /// Uniform in [0, 1).
++    mutating func unit() -> Double {
++        Double(next() >> 11) / 9_007_199_254_740_992.0
++    }
++
++    /// Uniform in [-1, 1).
++    mutating func symmetric() -> Double {
++        unit() * 2.0 - 1.0
++    }
++}
++
++private enum Synthetic {
++    static let sampleRate = 16_000.0
++
++    /// Speech-like: white noise through a two-pole resonator, gated into
++    /// "syllables" of 200–400 ms separated by 100–300 ms of silence, normalised
++    /// to `targetRMS` over its active samples.
++    static func speechLike(count: Int, seed: UInt64, targetRMS: Double = 0.12) -> [Float] {
++        var envelopeRNG = SplitMix64(seed: seed)
++        var noiseRNG = SplitMix64(seed: seed &+ 1)
++
++        var envelope = [Double](repeating: 0, count: count)
++        var position = 0
++        var voiced = true
++        while position < count {
++            let length: Int
++            let amplitude: Double
++            if voiced {
++                length = 3_200 + Int(envelopeRNG.unit() * 3_200)
++                amplitude = 0.5 + 0.5 * envelopeRNG.unit()
++            } else {
++                length = 1_600 + Int(envelopeRNG.unit() * 3_200)
++                amplitude = 0
++            }
++            for k in 0..<length where position + k < count {
++                let ramp = min(1.0, Double(min(k, length - 1 - k)) / 160.0)
++                envelope[position + k] = amplitude * ramp
++            }
++            position += length
++            voiced.toggle()
++        }
++
++        var values = [Double](repeating: 0, count: count)
++        var y1 = 0.0
++        var y2 = 0.0
++        var sumSquares = 0.0
++        var active = 0
++        for i in 0..<count {
++            let y = noiseRNG.symmetric() + 1.2 * y1 - 0.5 * y2
++            y2 = y1
++            y1 = y
++            let v = y * envelope[i]
++            values[i] = v
++            if envelope[i] > 0 {
++                sumSquares += v * v
++                active += 1
++            }
++        }
++        let scale = targetRMS / (sumSquares / Double(max(active, 1))).squareRoot()
++        return values.map { Float($0 * scale) }
++    }
++
++    /// What a laptop microphone hears of `far` played from its own speakers:
++    /// a direct path at 40 ms and three weaker reflections, plus a −63 dBFS
++    /// noise floor. Nobody is talking near the mic.
++    static let echoTaps: [(delay: Int, gain: Double)] = [(640, 0.45), (880, 0.18), (1_440, -0.10), (2_240, 0.05)]
++
++    static func echo(of far: [Float], noiseSeed: UInt64 = 99, noiseAmplitude: Double = 0.0005) -> [Float] {
++        var rng = SplitMix64(seed: noiseSeed)
++        var mic = [Float](repeating: 0, count: far.count)
++        for i in 0..<far.count {
++            var v = 0.0
++            for tap in echoTaps where i >= tap.delay {
++                v += tap.gain * Double(far[i - tap.delay])
++            }
++            v += rng.symmetric() * noiseAmplitude
++            mic[i] = Float(v)
++        }
++        return mic
++    }
++
++    static func energy(_ x: [Float], _ range: Range<Int>) -> Double {
++        var sum = 0.0
++        for i in range { sum += Double(x[i]) * Double(x[i]) }
++        return sum
++    }
++
++    /// 10·log10(Σnear² / Σout²) over `range`.
++    static func reductionDb(near: [Float], out: [Float], over range: Range<Int>) -> Double {
++        10 * log10(max(energy(near, range), 1e-20) / max(energy(out, range), 1e-20))
++    }
++
++    static func buffer(_ samples: ArraySlice<Float>) -> AVAudioPCMBuffer {
++        let format = WhisperAudioFormat.pcmFloat32
++        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count))!
++        buffer.frameLength = AVAudioFrameCount(samples.count)
++        let channel = buffer.floatChannelData![0]
++        for (i, value) in samples.enumerated() { channel[i] = value }
++        return buffer
++    }
++}
++
++// MARK: - Delivering audio the way the capture callbacks would
++
++/// Feeds a session mic and reference chunks in capture order, pushing each
++/// chunk's host timestamp into the matching recorder's queue first — the
++/// producer side of `CaptureTimestampQueue`, which `consumeMic` /
++/// `consumeSystem` then pop.
++@MainActor
++private final class Pump {
++    let session: RecordingSession
++    let mic: [Float]
++    let reference: [Float]
++    let micChunk = 1_365          // one mic tap buffer at 16 kHz (4096 frames @ 48 kHz)
++    let refChunk = 320            // one ScreenCaptureKit buffer (20 ms)
++    /// How far (in media time) reference delivery runs ahead of the mic chunk
++    /// being delivered, in samples.
++    let refAhead: Int
++    let hostBase: Double
++    /// Added to every mic timestamp: a mic clock on a different basis.
++    let micClockOffset: Double
++    /// Push real timestamps (true) or `nil` for every buffer (false).
++    let sendTimestamps: Bool
++
++    private(set) var micIndex = 0
++    private(set) var refDelivered: Int
++
++    var micChunksTotal: Int { mic.count / micChunk }
++
++    init(session: RecordingSession, mic: [Float], reference: [Float],
++         refAhead: Int = 32_000, referenceStart: Int = 0,
++         hostBase: Double = 250_000, micClockOffset: Double = 0, sendTimestamps: Bool = true) {
++        self.session = session
++        self.mic = mic
++        self.reference = reference
++        self.refAhead = refAhead
++        self.refDelivered = referenceStart
++        self.hostBase = hostBase
++        self.micClockOffset = micClockOffset
++        self.sendTimestamps = sendTimestamps
++    }
++
++    /// Deliver `count` more mic chunks, each preceded by the reference up to
++    /// `refAhead` samples past that chunk's end.
++    func advance(micChunks count: Int) async {
++        for _ in 0..<count {
++            guard micIndex < micChunksTotal else { return }
++            let target = min(reference.count, (micIndex + 1) * micChunk + refAhead)
++            while refDelivered < target { await deliverReferenceChunk() }
++            await deliverMicChunk()
++        }
++    }
++
++    func deliverReferenceChunk() async {
++        let end = min(reference.count, refDelivered + refChunk)
++        session.system.timestamps.push(sendTimestamps ? hostBase + Double(refDelivered) / Synthetic.sampleRate : nil)
++        await session.consumeSystem(Synthetic.buffer(reference[refDelivered..<end]))
++        refDelivered = end
++    }
++
++    func deliverMicChunk() async {
++        let start = micIndex * micChunk
++        session.mic.timestamps.push(sendTimestamps
++                                    ? hostBase + micClockOffset + Double(start) / Synthetic.sampleRate
++                                    : nil)
++        await session.consumeMic(Synthetic.buffer(mic[start..<start + micChunk]))
++        micIndex += 1
++    }
++
++    /// Whatever reference is left (the meeting's tail).
++    func drainReference() async {
++        while refDelivered < reference.count { await deliverReferenceChunk() }
++    }
++
++    /// Everything, in ARRIVAL order: mic chunk j shows up when its last sample
++    /// has been captured; reference chunk k shows up `lateness` seconds after
++    /// its last sample was played. (ScreenCaptureKit delivery lags the mic in
++    /// practice, which is what the canceller's hold exists for.)
++    func runInArrivalOrder(referenceLateness lateness: Double) async {
++        struct Event { var time: Double; var isMic: Bool }
++        var events: [Event] = []
++        var end = refDelivered
++        while end < reference.count {
++            end = min(reference.count, end + refChunk)
++            events.append(Event(time: Double(end) / Synthetic.sampleRate + lateness, isMic: false))
++        }
++        for j in micIndex..<micChunksTotal {
++            events.append(Event(time: Double((j + 1) * micChunk) / Synthetic.sampleRate, isMic: true))
++        }
++        events.sort { lhs, rhs in
++            if lhs.time != rhs.time { return lhs.time < rhs.time }
++            return !lhs.isMic && rhs.isMic
++        }
++        for event in events {
++            if event.isMic {
++                await deliverMicChunk()
++            } else {
++                await deliverReferenceChunk()
++            }
++        }
++    }
++}
++
++// MARK: - Tests
++
++@MainActor
++final class RecordingSessionEchoCancellationTests: XCTestCase {
++
++    // 160 mic chunks ≈ 13.65 s, a multiple of the canceller's 160-sample frame.
++    private let micChunks = 160
++    private var micCount: Int { micChunks * 1_365 }
++    private let referenceTail = 48_000
++
++    // MARK: Helpers
++
++    private func freshDefaults(saveDebugAudio: Bool = false) -> UserDefaults {
++        let suite = "RecordingSessionEchoCancellationTests.\(UUID().uuidString)"
++        let defaults = UserDefaults(suiteName: suite)!
++        defaults.removePersistentDomain(forName: suite)
++        // Explicit values for both keys: a suite is never assumed to read the
++        // code defaults.
++        defaults.set(false, forKey: EchoCancellationSettings.Keys.enabled)
++        defaults.set(saveDebugAudio, forKey: EchoCancellationSettings.Keys.saveDebugAudio)
++        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
++        return defaults
++    }
++
++    private func makeStage() throws -> EchoCancellationStage {
++        try XCTUnwrap(EchoCancellationStage(), "the echo canceller should be creatable")
++    }
++
++    private func tempWAV(_ label: String) -> URL {
++        let url = FileManager.default.temporaryDirectory
++            .appendingPathComponent("aec-\(label)-\(UUID().uuidString).wav")
++        addTeardownBlock {
++            try? FileManager.default.removeItem(at: url)
++            let base = url.deletingPathExtension().lastPathComponent
++            for role in ["mic", "ref", "clean"] {
++                try? FileManager.default.removeItem(
++                    at: AECDebugAudioWriter.directory(for: url).appendingPathComponent("\(base).aec-\(role).wav"))
++            }
++        }
++        return url
++    }
++
++    /// A fake MEETING session writing a real WAV, with `stage` installed through
++    /// the test seam (nil = the existing path, no stage).
++    private func makeSession(stage: EchoCancellationStage?,
++                             deferGain: Bool = true,
++                             gain: AdaptiveGainController? = nil,
++                             defaults: UserDefaults? = nil,
++                             label: String = "session") async throws -> (session: RecordingSession, url: URL) {
++        let url = tempWAV(label)
++        let session = RecordingSession()
++        try await session.startFakeMeetingForTesting(outputURL: url)
++        session.installEchoStageForTesting(stage, deferGain: deferGain, gain: gain,
++                                           defaults: defaults ?? freshDefaults())
++        return (session, url)
++    }
++
++    private func samples(of url: URL) throws -> [Float] {
++        try AudioConvert.loadAsWhisperSamples(url: url)
++    }
++
++    private func debugAudio(for url: URL) throws -> (mic: [Float], ref: [Float], clean: [Float]) {
++        let directory = AECDebugAudioWriter.directory(for: url)
++        let base = url.deletingPathExtension().lastPathComponent
++        func load(_ role: String) throws -> [Float] {
++            try samples(of: directory.appendingPathComponent("\(base).aec-\(role).wav"))
++        }
++        return (try load("mic"), try load("ref"), try load("clean"))
++    }
++
++    /// Raw-mic vs cleaned-mic energy over the last 5 s of the recording, from the
++    /// debug audio dump (which, unlike the mix, does not depend on how the mixer
++    /// happened to pair the two legs).
++    private func steadyStateReduction(_ dump: (mic: [Float], ref: [Float], clean: [Float])) -> Double {
++        guard dump.mic.count >= micCount, dump.clean.count >= micCount else {
++            XCTFail("debug audio is shorter than the recording: \(dump.mic.count) / \(dump.clean.count) < \(micCount)")
++            return -.infinity
++        }
++        return Synthetic.reductionDb(near: dump.mic, out: dump.clean, over: (micCount - 80_000)..<micCount)
++    }
++
++    /// The part of the mix that came from the microphone: the mixer averages
++    /// (mic + app) wherever both are buffered, so given the app audio that was
++    /// paired with it, `2·file − app` is the mic path alone.
++    private func micPath(ofMix file: [Float], app: [Float], count: Int) -> [Float] {
++        (0..<count).map { 2 * file[$0] - app[$0] }
++    }
++
++    // MARK: - Echo is actually removed from the saved mix
++
++    /// The headline: the same meeting through the same session code, once
++    /// without the stage (today's behaviour) and once with it. The mic path of
++    /// the saved WAV must carry at least 10 dB less echo energy with the stage.
++    ///
++    /// The app audio is delivered well ahead of the mic (2 s) so the mixer pairs
++    /// mic sample i with app sample i exactly — which lets the test subtract the
++    /// app audio back out of the WAV and look at the mic path alone. It also
++    /// means arrival order cannot align the two streams; only the capture
++    /// timestamps do.
++    func test_the_saved_mix_has_far_less_echo_with_the_stage_than_without() async throws {
++        let reference = Synthetic.speechLike(count: micCount + referenceTail, seed: 7)
++        let mic = Array(Synthetic.echo(of: reference).prefix(micCount))
++
++        // Baseline: no stage — exactly the existing path.
++        let baseline = try await makeSession(stage: nil, label: "baseline")
++        let baselinePump = Pump(session: baseline.session, mic: mic, reference: reference)
++        await baselinePump.advance(micChunks: micChunks)
++        await baselinePump.drainReference()
++        _ = await baseline.session.stop()
++        let baselineMix = try samples(of: baseline.url)
++
++        // With the stage.
++        let stage = try makeStage()
++        let withStage = try await makeSession(stage: stage, label: "with-stage")
++        let pump = Pump(session: withStage.session, mic: mic, reference: reference)
++        await pump.advance(micChunks: micChunks)
++        await pump.drainReference()
++        XCTAssertTrue(withStage.session.echo.timestampsTrusted, "consistent clocks must stay trusted")
++        _ = await withStage.session.stop()
++        let cleanedMix = try samples(of: withStage.url)
++
++        // Nothing lost, nothing added: mic samples + the app-audio tail, as before.
++        XCTAssertEqual(baselineMix.count, reference.count)
++        XCTAssertEqual(cleanedMix.count, baselineMix.count,
++                       "the stage must not change how much audio is written")
++
++        // The extraction is exact when the stage is absent (mic path == raw mic)...
++        let baselineMic = micPath(ofMix: baselineMix, app: reference, count: micCount)
++        var worstDifference: Float = 0
++        for i in 0..<micCount { worstDifference = max(worstDifference, abs(baselineMic[i] - mic[i])) }
++        XCTAssertLessThan(worstDifference, 1e-4, "test harness: the mic path should be recoverable from the mix")
++
++        // ...so the same arithmetic on the stage run is the cleaned mic.
++        let cleanedMic = micPath(ofMix: cleanedMix, app: reference, count: micCount)
++        let steadyState = (micCount - 80_000)..<micCount        // last 5 s, after convergence
++        let reduction = Synthetic.reductionDb(near: mic, out: cleanedMic, over: steadyState)
++        let baselineReduction = Synthetic.reductionDb(near: mic, out: baselineMic, over: steadyState)
++        XCTAssertEqual(baselineReduction, 0, accuracy: 0.1, "without the stage nothing is removed")
++        XCTAssertGreaterThanOrEqual(reduction, 10,
++                                    "echo energy in the saved mic path should drop by >= 10 dB (got \(reduction) dB)")
++        XCTAssertGreaterThan(stage.statistics.framesProcessed, 0)
++    }
++
++    // MARK: - Timestamps are what align the streams
++
++    /// ScreenCaptureKit delivers nothing while the app is silent, so the
++    /// reference stream can start seconds after the mic. Arrival order cannot
++    /// recover that gap; the capture timestamps can.
++    func test_a_late_starting_reference_is_aligned_by_timestamps_and_not_by_arrival_order() async throws {
++        let silentStart = 32_000                                         // 2 s of nothing from the app
++        var reference = Synthetic.speechLike(count: micCount + referenceTail, seed: 11)
++        for i in 0..<silentStart { reference[i] = 0 }
++        let mic = Array(Synthetic.echo(of: reference).prefix(micCount))
++
++        func reduction(sendTimestamps: Bool, label: String) async throws -> Double {
++            let run = try await makeSession(stage: try makeStage(),
++                                            defaults: freshDefaults(saveDebugAudio: true),
++                                            label: label)
++            let pump = Pump(session: run.session, mic: mic, reference: reference,
++                            refAhead: 0, referenceStart: silentStart, sendTimestamps: sendTimestamps)
++            await pump.advance(micChunks: micChunks)
++            await pump.drainReference()
++            _ = await run.session.stop()
++            let dump = try debugAudio(for: run.url)
++            XCTAssertEqual(dump.mic.count, dump.clean.count)
++            return steadyStateReduction(dump)
++        }
++
++        let withTimestamps = try await reduction(sendTimestamps: true, label: "late-ref-ts")
++        let withoutTimestamps = try await reduction(sendTimestamps: false, label: "late-ref-nots")
++        XCTAssertGreaterThanOrEqual(withTimestamps, 10,
++                                    "with timestamps the gap is understood (got \(withTimestamps) dB)")
++        XCTAssertLessThan(withoutTimestamps, 6,
++                          "without timestamps the 2 s gap misaligns the streams — this is the case the feature exists for (got \(withoutTimestamps) dB)")
++    }
++
++    /// The reference arriving AFTER the mic chunk that covers the same moment
++    /// (the usual order: the SCK callback lags the mic tap). The canceller holds
++    /// mic frames until the reference shows up; the session must cope with
++    /// `echoProcessMic` returning nothing for a while and then a burst.
++    func test_a_reference_that_arrives_after_the_mic_is_still_cancelled() async throws {
++        let reference = Synthetic.speechLike(count: micCount + referenceTail, seed: 7)
++        let mic = Array(Synthetic.echo(of: reference).prefix(micCount))
++        let stage = try makeStage()
++        let run = try await makeSession(stage: stage,
++                                        defaults: freshDefaults(saveDebugAudio: true),
++                                        label: "late-reference")
++        let pump = Pump(session: run.session, mic: mic, reference: reference, refAhead: 0)
++        await pump.runInArrivalOrder(referenceLateness: 0.060)
++        _ = await run.session.stop()
++
++        let dump = try debugAudio(for: run.url)
++        let reduction = steadyStateReduction(dump)
++        XCTAssertGreaterThanOrEqual(reduction, 10, "got \(reduction) dB")
++        // Every mic frame is processed exactly once. The Speex preprocessor delays its output by one
++        // frame, so the final flush feeds the stage one extra silence frame to drain it.
++        XCTAssertGreaterThanOrEqual(stage.statistics.framesProcessed, micCount / 160)
++        XCTAssertLessThanOrEqual(stage.statistics.framesProcessed, micCount / 160 + 1)
++        let mix = try samples(of: run.url)
++        XCTAssertGreaterThanOrEqual(mix.count, micCount, "no mic audio may be lost")
++    }
++
++    // MARK: - Capture clocks
++
++    /// Mic and app-audio timestamps on bases further apart than 5 s mean the SCK
++    /// clock assumption does not hold: the session stops passing timestamps in,
++    /// keeps every mic sample, and says so.
++    func test_a_clock_basis_mismatch_switches_to_arrival_order_without_losing_audio() async throws {
++        let stage = try makeStage()
++        let defaults = freshDefaults()
++        let run = try await makeSession(stage: stage, defaults: defaults, label: "clock-mismatch")
++        let mic = Synthetic.speechLike(count: 40 * 1_365, seed: 3, targetRMS: 0.05)
++        let silence = [Float](repeating: 0, count: 320)
++        let pump = Pump(session: run.session, mic: mic, reference: [], micClockOffset: 0)
++
++        await pump.deliverMicChunk()                                       // the mic always starts first
++        XCTAssertTrue(run.session.echo.timestampsTrusted)
++        XCTAssertFalse(run.session.echo.clockChecked, "nothing to compare against yet")
++
++        // The app audio's first buffer, stamped on a clock 1000 s away.
++        run.session.system.timestamps.push(249_000.0)
++        await run.session.consumeSystem(Synthetic.buffer(silence[...]))
++        XCTAssertTrue(run.session.echo.clockChecked)
++        XCTAssertFalse(run.session.echo.timestampsTrusted, "a 1000 s gap is not the same clock")
++
++        await pump.advance(micChunks: 39)
++        _ = await run.session.stop()
++
++        // The 320 app samples are mixed into the first 320 mic samples (their
++        // average with silence); everything else is the mic at full scale.
++        // All 40 chunks of mic audio must have been written, none twice.
++        let written = try samples(of: run.url)
++        XCTAssertEqual(written.count, 40 * 1_365)
++        XCTAssertEqual(defaults.string(forKey: EchoCancellationSettings.Keys.lastSessionSummary)?
++            .contains("clocks disagreed"), true,
++                       "the Settings summary should say the clocks disagreed")
++    }
++
++    func test_clocks_that_agree_stay_trusted() async throws {
++        let stage = try makeStage()
++        let run = try await makeSession(stage: stage, label: "clock-agree")
++        let mic = Synthetic.speechLike(count: 10 * 1_365, seed: 3, targetRMS: 0.05)
++        let pump = Pump(session: run.session, mic: mic, reference: [])
++        await pump.deliverMicChunk()
++        run.session.system.timestamps.push(250_000.010)                    // 10 ms off: ordinary jitter
++        await run.session.consumeSystem(Synthetic.buffer([Float](repeating: 0, count: 320)[...]))
++        XCTAssertTrue(run.session.echo.clockChecked)
++        XCTAssertTrue(run.session.echo.timestampsTrusted)
++        await run.session.cancelAll()
++    }
++
++    /// ScreenCaptureKit sends nothing until the app makes a sound, so on a
++    /// healthy meeting the first app-audio timestamp can be far later than the
++    /// first mic timestamp. That is NOT a clock mismatch: the check compares
++    /// what each clock says "now", not where each stream began.
++    func test_a_far_end_that_stays_silent_for_a_while_is_not_mistaken_for_a_clock_mismatch() async throws {
++        let stage = try makeStage()
++        let run = try await makeSession(stage: stage, label: "silent-start")
++        let chunks = 300                                                    // ≈ 25 s of mic audio
++        let mic = Synthetic.speechLike(count: chunks * 1_365, seed: 5, targetRMS: 0.05)
++        let pump = Pump(session: run.session, mic: mic, reference: [])
++        await pump.advance(micChunks: chunks - 1)
++
++        // 25 s in, the app finally plays something — stamped on the SAME clock.
++        let now = 250_000 + Double((chunks - 1) * 1_365) / 16_000
++        run.session.system.timestamps.push(now)
++        await run.session.consumeSystem(Synthetic.buffer([Float](repeating: 0.01, count: 320)[...]))
++        XCTAssertTrue(run.session.echo.clockChecked)
++        XCTAssertTrue(run.session.echo.timestampsTrusted,
++                      "a late first reference on a consistent clock must not trip the 5 s check")
++        await run.session.cancelAll()
++    }
++
++    // MARK: - Pause, resume, stop: no audio held back, no timestamp left behind
++
++    /// The canceller holds the last ~150 ms of mic audio waiting for reference.
++    /// A pause must write it (it is audio from before the pause), and the final
++    /// stop must write what is held then. Mic-only here (no reference at all),
++    /// so every mic sample must come out exactly once.
++    func test_pause_resume_and_stop_write_every_held_sample() async throws {
++        let stage = try makeStage()
++        let run = try await makeSession(stage: stage, label: "pause-flush")
++        final class Counter { var samples = 0 }
++        let live = Counter()
++        run.session.onLiveSamples = { live.samples += $0.count }
++
++        let mic = Synthetic.speechLike(count: 100 * 1_365, seed: 21, targetRMS: 0.05)
++        let pump = Pump(session: run.session, mic: mic, reference: [])
++
++        await pump.advance(micChunks: 40)
++        XCTAssertLessThan(live.samples, 40 * 1_365, "the canceller is holding some audio back")
++        await run.session.pause()
++        XCTAssertEqual(live.samples, 40 * 1_365,
++                       "pause() must flush what the canceller was holding")
++
++        // Paused: buffers are dropped, but their timestamps are still consumed.
++        await pump.advance(micChunks: 20)
++        XCTAssertEqual(live.samples, 40 * 1_365, "nothing is written while paused")
++        XCTAssertEqual(run.session.mic.timestamps.pendingCount, 0,
++                       "a dropped buffer must still pop its timestamp or the queue slides out of step")
++
++        run.session.resume()
++        await pump.advance(micChunks: 40)
++        _ = await run.session.stop()
++
++        XCTAssertEqual(live.samples, 80 * 1_365)
++        XCTAssertEqual(try samples(of: run.url).count, 80 * 1_365,
++                       "every mic sample outside the pause is in the WAV")
++    }
++
++    func test_system_timestamps_are_consumed_while_paused_too() async throws {
++        let run = try await makeSession(stage: try makeStage(), label: "paused-system")
++        await run.session.pause()
++        for i in 0..<5 {
++            run.session.system.timestamps.push(250_000 + Double(i) * 0.02)
++            await run.session.consumeSystem(Synthetic.buffer([Float](repeating: 0, count: 320)[...]))
++        }
++        XCTAssertEqual(run.session.system.timestamps.pendingCount, 0)
++        run.session.resume()
++        _ = await run.session.stop()
++    }
++
++    // MARK: - Gain goes after the canceller
++
++    /// With echo cancellation on, the tap leaves the mic alone and the session
++    /// applies the gain controller to the cleaned samples — once, and only when
++    /// the tap deferred it. A controller pinned to ×4 makes that exact: the
++    /// mic path of the mix must be four times the same run without gain.
++    func test_deferred_gain_is_applied_once_to_the_cleaned_samples() async throws {
++        let mic = Synthetic.speechLike(count: 64 * 1_365, seed: 31, targetRMS: 0.02)   // peaks stay far below clipping at ×4
++
++        func run(deferGain: Bool, gain: AdaptiveGainController?, label: String) async throws -> [Float] {
++            let result = try await makeSession(stage: try makeStage(), deferGain: deferGain, gain: gain, label: label)
++            let pump = Pump(session: result.session, mic: mic, reference: [])
++            await pump.advance(micChunks: 64)
++            _ = await result.session.stop()
++            return try samples(of: result.url)
++        }
++        func fixedGainFour() -> AdaptiveGainController {
++            // Min == max pins the gain at ×4; a zero floor multiplier lets any
++            // non-silent frame adapt immediately.
++            AdaptiveGainController(maxGain: 4, minGain: 4, noiseFloorMultiplier: 0)
++        }
++
++        let plain = try await run(deferGain: true, gain: nil, label: "gain-none")
++        let deferred = try await run(deferGain: true, gain: fixedGainFour(), label: "gain-deferred")
++        let alreadyInTap = try await run(deferGain: false, gain: fixedGainFour(), label: "gain-in-tap")
++
++        XCTAssertEqual(plain.count, 64 * 1_365)
++        XCTAssertEqual(deferred.count, plain.count)
++        XCTAssertEqual(alreadyInTap.count, plain.count)
++
++        var worstDeferred: Float = 0
++        var worstTap: Float = 0
++        for i in 0..<plain.count {
++            worstDeferred = max(worstDeferred, abs(deferred[i] - 4 * plain[i]))
++            worstTap = max(worstTap, abs(alreadyInTap[i] - plain[i]))
++        }
++        XCTAssertLessThan(worstDeferred, 1e-5, "deferred gain: the cleaned mic must be scaled by the controller exactly once")
++        XCTAssertEqual(worstTap, 0, accuracy: 1e-7,
++                       "when the tap already applied gain (deferGain false) the session must not apply it again")
++    }
++
++    // MARK: - Lifecycle and the existing path
++
++    /// A meeting WITHOUT a stage — the setting off, or any other source — must be
++    /// the unchanged existing path, queues untouched.
++    func test_without_a_stage_the_recorders_and_the_mix_are_untouched() async throws {
++        let run = try await makeSession(stage: nil, label: "no-stage")
++        XCTAssertNil(run.session.echo.stage)
++        XCTAssertFalse(run.session.mic.timestamps.isEnabled)
++        XCTAssertFalse(run.session.system.timestamps.isEnabled)
++        XCTAssertFalse(run.session.mic.deferGainToConsumer)
++
++        let mic = [Float](repeating: 0.2, count: 1_365)
++        let app = [Float](repeating: 0.1, count: 1_365)
++        run.session.mic.timestamps.push(1)                                 // disabled: a no-op
++        run.session.system.timestamps.push(1)
++        await run.session.consumeSystem(Synthetic.buffer(app[...]))
++        await run.session.consumeMic(Synthetic.buffer(mic[...]))
++        XCTAssertEqual(run.session.mic.timestamps.pendingCount, 0)
++        XCTAssertEqual(run.session.system.timestamps.pendingCount, 0)
++        _ = await run.session.stop()
++
++        let written = try samples(of: run.url)
++        XCTAssertEqual(written.count, 1_365)
++        XCTAssertEqual(written[0], (0.2 + 0.1) * 0.5, accuracy: 1e-6, "mic and app averaged, as before")
++    }
++
++    /// `startFakeForTesting` — what every other session test drives — never creates a stage.
++    func test_the_standard_fake_session_never_has_a_stage() async {
++        let session = RecordingSession()
++        let url = tempWAV("standard-fake")
++        await session.startFakeForTesting(outputURL: url)
++        XCTAssertNil(session.echo.stage)
++        XCTAssertFalse(session.mic.timestamps.isEnabled)
++        XCTAssertFalse(session.system.timestamps.isEnabled)
++        XCTAssertFalse(session.mic.deferGainToConsumer)
++        await session.pause()
++        session.resume()
++        _ = await session.stop()
++        XCTAssertNil(session.echo.stage)
++    }
++
++    func test_stop_stores_the_summary_and_releases_everything() async throws {
++        let stage = try makeStage()
++        let defaults = freshDefaults()
++        let run = try await makeSession(stage: stage, defaults: defaults, label: "summary")
++        XCTAssertTrue(run.session.mic.timestamps.isEnabled)
++        XCTAssertTrue(run.session.system.timestamps.isEnabled)
++        XCTAssertTrue(run.session.mic.deferGainToConsumer)
++        XCTAssertNil(EchoCancellationSettings.storedSessionSummary(defaults), "no summary before the meeting ends")
++
++        let mic = Synthetic.speechLike(count: 20 * 1_365, seed: 9, targetRMS: 0.05)
++        let pump = Pump(session: run.session, mic: mic, reference: [])
++        await pump.advance(micChunks: 20)
++        _ = await run.session.stop()
++
++        let summary = try XCTUnwrap(EchoCancellationSettings.storedSessionSummary(defaults))
++        XCTAssertTrue(summary.hasPrefix("echo reduc"), summary)
++        XCTAssertTrue(summary.contains("reference present"), summary)
++        XCTAssertNil(run.session.echo.stage)
++        XCTAssertFalse(run.session.mic.timestamps.isEnabled)
++        XCTAssertFalse(run.session.system.timestamps.isEnabled)
++        XCTAssertFalse(run.session.mic.deferGainToConsumer)
++    }
++
++    func test_cancelAll_drops_the_stage_without_writing_a_summary() async throws {
++        let defaults = freshDefaults()
++        let run = try await makeSession(stage: try makeStage(), defaults: defaults, label: "cancel")
++        let mic = Synthetic.speechLike(count: 5 * 1_365, seed: 9, targetRMS: 0.05)
++        let pump = Pump(session: run.session, mic: mic, reference: [])
++        await pump.advance(micChunks: 5)
++
++        await run.session.cancelAll()
++        XCTAssertNil(run.session.echo.stage)
++        XCTAssertFalse(run.session.mic.timestamps.isEnabled)
++        XCTAssertFalse(run.session.system.timestamps.isEnabled)
++        XCTAssertFalse(run.session.mic.deferGainToConsumer)
++        XCTAssertNil(EchoCancellationSettings.storedSessionSummary(defaults))
++    }
++
++    /// `start()` decides from the settings: a meeting with the setting on gets a
++    /// stage, deferred gain and armed queues; anything else gets none of it.
++    func test_begin_creates_a_stage_only_for_a_meeting_with_the_setting_on() throws {
++        let on = freshDefaults()
++        on.set(true, forKey: EchoCancellationSettings.Keys.enabled)
++        let off = freshDefaults()                   // freshDefaults() sets `enabled = false` explicitly
++        let url = tempWAV("begin")
++
++        let meetingOn = RecordingSession()
++        meetingOn.echo.defaults = on
++        meetingOn.beginEchoCancellation(source: .meeting, outputURL: url)
++        XCTAssertNotNil(meetingOn.echo.stage)
++        XCTAssertTrue(meetingOn.mic.timestamps.isEnabled)
++        XCTAssertTrue(meetingOn.system.timestamps.isEnabled)
++        XCTAssertTrue(meetingOn.mic.deferGainToConsumer)
++        XCTAssertTrue(meetingOn.echo.deferredGain)
++        meetingOn.discardEchoCancellation()
++        XCTAssertNil(meetingOn.echo.stage)
++        XCTAssertFalse(meetingOn.mic.deferGainToConsumer)
++
++        let meetingOff = RecordingSession()
++        meetingOff.echo.defaults = off
++        meetingOff.beginEchoCancellation(source: .meeting, outputURL: url)
++        XCTAssertNil(meetingOff.echo.stage, "setting off: today's behaviour")
++        XCTAssertFalse(meetingOff.mic.timestamps.isEnabled)
++        XCTAssertFalse(meetingOff.mic.deferGainToConsumer)
++
++        for source in [RecordingSource.microphone, .systemAudio] {
++            let other = RecordingSession()
++            other.echo.defaults = on
++            other.beginEchoCancellation(source: source, outputURL: url)
++            XCTAssertNil(other.echo.stage, "\(source.rawValue) recordings have no reference to cancel against")
++            XCTAssertFalse(other.mic.timestamps.isEnabled)
++            XCTAssertFalse(other.system.timestamps.isEnabled)
++            XCTAssertFalse(other.mic.deferGainToConsumer)
++        }
++    }
++
++    // MARK: - Debug audio
++
++    /// The three files are parallel, the raw mic is what went in, and the clean
++    /// file is what the mixer wrote (mic-only: no app audio). The debug "clean"
++    /// file is the canceller's output BEFORE gain, so gain must be identity here:
++    /// `deferGain: false` models a tap that already applied it, and the session
++    /// has no controller of its own to apply.
++    func test_debug_audio_files_capture_the_raw_aligned_and_cleaned_streams() async throws {
++        let chunks = 64                                                       // 87 360 samples = 546 whole frames
++        let mic = Synthetic.speechLike(count: chunks * 1_365, seed: 41, targetRMS: 0.05)
++        let run = try await makeSession(stage: try makeStage(),
++                                        deferGain: false,
++                                        defaults: freshDefaults(saveDebugAudio: true),
++                                        label: "debug-audio")
++        let pump = Pump(session: run.session, mic: mic, reference: [])
++        await pump.advance(micChunks: chunks)
++        _ = await run.session.stop()
++
++        let dump = try debugAudio(for: run.url)
++        let written = try samples(of: run.url)
++        XCTAssertEqual(dump.mic.count, chunks * 1_365)
++        XCTAssertEqual(dump.ref.count, dump.mic.count)
++        XCTAssertEqual(dump.clean.count, dump.mic.count)
++        XCTAssertEqual(written.count, dump.mic.count)
++        // Every sample, not a sample of them: a shift anywhere must fail.
++        var worstMic: Float = 0, worstRef: Float = 0, worstClean: Float = 0
++        for i in 0..<min(dump.mic.count, dump.ref.count, dump.clean.count, written.count, mic.count) {
++            worstMic = max(worstMic, abs(dump.mic[i] - mic[i]))
++            worstRef = max(worstRef, abs(dump.ref[i]))
++            worstClean = max(worstClean, abs(dump.clean[i] - written[i]))
++        }
++        XCTAssertLessThan(worstMic, 1e-4, "raw mic is what went in, sample for sample")
++        XCTAssertLessThan(worstRef, 1e-7, "no reference was delivered")
++        XCTAssertLessThan(worstClean, 1e-6, "cleaned mic is what the mixer wrote, sample for sample")
++    }
++
++    /// A pause flushes the stage and restarts its timeline. The dump must stay
++    /// parallel and complete across it: exactly the audio that was recorded
++    /// (nothing from the paused span), with the clean file equal to the recording.
++    func test_debug_audio_stays_aligned_and_complete_across_a_pause() async throws {
++        let mic = Synthetic.speechLike(count: 100 * 1_365, seed: 43, targetRMS: 0.05)
++        let run = try await makeSession(stage: try makeStage(),
++                                        deferGain: false,
++                                        defaults: freshDefaults(saveDebugAudio: true),
++                                        label: "debug-pause")
++        let pump = Pump(session: run.session, mic: mic, reference: [])
++        await pump.advance(micChunks: 40)
++        await run.session.pause()
++        await pump.advance(micChunks: 20)                                    // dropped while paused
++        run.session.resume()
++        await pump.advance(micChunks: 40)
++        _ = await run.session.stop()
++
++        let recorded = Array(mic[0..<(40 * 1_365)]) + Array(mic[(60 * 1_365)..<(100 * 1_365)])
++        let dump = try debugAudio(for: run.url)
++        let written = try samples(of: run.url)
++        XCTAssertEqual(written.count, recorded.count)
++        XCTAssertEqual(dump.mic.count, recorded.count)
++        XCTAssertEqual(dump.ref.count, recorded.count)
++        XCTAssertEqual(dump.clean.count, recorded.count)
++        var worstMic: Float = 0, worstClean: Float = 0
++        for i in 0..<min(dump.mic.count, dump.clean.count, written.count, recorded.count) {
++            worstMic = max(worstMic, abs(dump.mic[i] - recorded[i]))
++            worstClean = max(worstClean, abs(dump.clean[i] - written[i]))
++        }
++        XCTAssertLessThan(worstMic, 1e-4, "raw mic is the audio outside the pause, in order")
++        XCTAssertLessThan(worstClean, 1e-6, "cleaned mic is the recording, across the pause")
++    }
++
++    func test_debug_audio_is_off_unless_asked_for() async throws {
++        let mic = Synthetic.speechLike(count: 8 * 1_365, seed: 41, targetRMS: 0.05)
++        let run = try await makeSession(stage: try makeStage(), defaults: freshDefaults(), label: "debug-off")
++        let pump = Pump(session: run.session, mic: mic, reference: [])
++        await pump.advance(micChunks: 8)
++        _ = await run.session.stop()
++        let base = run.url.deletingPathExtension().lastPathComponent
++        let micDump = AECDebugAudioWriter.directory(for: run.url).appendingPathComponent("\(base).aec-mic.wav")
++        XCTAssertFalse(FileManager.default.fileExists(atPath: micDump.path))
++        XCTAssertNil(run.session.echo.debugAudio)
++    }
++
++    /// The writer on its own: batches across its internal flush threshold and
++    /// closes cleanly.
++    func test_debug_writer_round_trips_frames_across_its_batch_boundary() throws {
++        let url = tempWAV("writer")
++        let writer = try AECDebugAudioWriter(recordingURL: url)
++        var near: [Float] = [], far: [Float] = [], out: [Float] = []
++        for frame in 0..<260 {                                               // 41 600 samples: > 2 batches
++            let n = (0..<160).map { Float(frame * 160 + $0) / 100_000 }
++            writer.append(near: n, far: n.map { -$0 }, out: n.map { 2 * $0 })
++            near += n
++            far += n.map { -$0 }
++            out += n.map { 2 * $0 }
++        }
++        writer.close()
++        writer.close()                                                        // idempotent
++
++        let dump = try debugAudio(for: url)
++        XCTAssertEqual(dump.mic, near)
++        XCTAssertEqual(dump.ref, far)
++        XCTAssertEqual(dump.clean, out)
++    }
++
++    /// The canceller's observer delivers chunks of 1...160 samples, not whole
++    /// frames: the writer must keep the three files parallel whatever the sizes.
++    func test_debug_writer_round_trips_chunks_of_any_length() throws {
++        let url = tempWAV("writer-variable")
++        let writer = try AECDebugAudioWriter(recordingURL: url)
++        let sizes = [1, 160, 37, 159, 160, 2, 100]
++        var near: [Float] = [], far: [Float] = [], out: [Float] = []
++        var next = 0
++        var k = 0
++        while near.count < 50_000 {                                           // > 3 batches
++            var n: [Float] = []
++            for _ in 0..<sizes[k % sizes.count] {
++                n.append(Float(next % 90_000) / 100_000)
++                next += 1
++            }
++            k += 1
++            writer.append(near: n, far: n.map { -$0 }, out: n.map { 2 * $0 })
++            near += n
++            far += n.map { -$0 }
++            out += n.map { 2 * $0 }
++        }
++        writer.close()
++
++        let dump = try debugAudio(for: url)
++        XCTAssertEqual(dump.mic, near)
++        XCTAssertEqual(dump.ref, far)
++        XCTAssertEqual(dump.clean, out)
++    }
++}
+-- 
+2.43.0
+
